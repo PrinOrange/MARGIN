@@ -1,10 +1,4 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-自适应球面度量学习 - 单标签多分类漏洞检测
-针对难度和频率双重不平衡场景
-"""
-
+from collections import Counter
 import os
 import json
 import math
@@ -22,7 +16,6 @@ from sklearn.metrics import (
     f1_score,
     precision_score,
     recall_score,
-    confusion_matrix,
 )
 from sklearn.manifold import TSNE
 import matplotlib
@@ -31,8 +24,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 from scipy.spatial.distance import cdist
-from typing import Dict, List, Tuple, Optional
 import warnings
+from utils.seed import set_seed
 
 warnings.filterwarnings("ignore")
 
@@ -41,7 +34,7 @@ warnings.filterwarnings("ignore")
 DATASET_NAME = "codemetic/MARGIN"
 DATASET_SUBSET = "debug"  # 可选: diversevul, bigvul, megavul
 MAX_SEQ_LENGTH = 512
-BATCH_SIZE = 32
+BATCH_SIZE = 64
 NUM_WORKERS = 4
 
 # 模型配置
@@ -52,10 +45,11 @@ ALPHA_CONFIDENCE = 0.9
 
 # 训练配置
 MAX_EPOCHS = 200
-EARLY_STOP_PATIENCE = 20
+EARLY_STOP_PATIENCE = MAX_EPOCHS
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 WARMUP_RATIO = 0.1
+SEED = 42
 
 # 设备配置
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -66,11 +60,13 @@ REPORT_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "report")
 PROTOTYPE_ALIGNMENT_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prototype-alignment")
 PROTOTYPE_DISPERSION_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prototype-dispersion")
 UMAP_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prototype-umap")
+MARGIN_HEATMAP_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "margin_heatmap")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(REPORT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(PROTOTYPE_ALIGNMENT_OUTPUT_DIR, exist_ok=True)
 os.makedirs(PROTOTYPE_DISPERSION_OUTPUT_DIR, exist_ok=True)
 os.makedirs(UMAP_OUTPUT_DIR, exist_ok=True)
+os.makedirs(MARGIN_HEATMAP_OUTPUT_DIR, exist_ok=True)
 
 
 # ==================== 数据集类 ====================
@@ -118,6 +114,7 @@ class AdaptiveSphereModel(nn.Module):
 
         # 类别权重原型 (在超球面上)
         self.weight_prototypes = nn.Parameter(torch.randn(num_classes, hidden_dim))
+        self.margin_matrix = torch.zeros(num_classes, num_classes, device=DEVICE)
 
         # 初始化权重原型
         self._init_prototypes()
@@ -187,15 +184,13 @@ class AdaptiveSphereModel(nn.Module):
         # 获取每个样本的标签索引
         labels_tensor = torch.tensor(labels, dtype=torch.long, device=features.device)
 
-        # 计算自适应margin矩阵
-        margin_matrix = torch.zeros(num_classes, num_classes, device=features.device)
         for i in range(num_classes):
             for j in range(num_classes):
                 if i != j:
                     margin = self.compute_adaptive_margin(
                         kappa_values[i].item(), kappa_values[j].item()
                     )
-                    margin_matrix[i, j] = margin
+                    self.margin_matrix[i, j] = margin
 
         # 对正类应用margin
         theta_with_margin = cosine_sim.clone()
@@ -203,7 +198,9 @@ class AdaptiveSphereModel(nn.Module):
             true_label = labels_tensor[idx]
             for j in range(num_classes):
                 if j != true_label:
-                    theta_with_margin[idx, true_label] -= margin_matrix[true_label, j]
+                    theta_with_margin[idx, true_label] -= self.margin_matrix[
+                        true_label, j
+                    ]
 
         # 应用scale
         logits = SCALE_S * theta_with_margin
@@ -273,7 +270,7 @@ def compute_metrics_positive_macro(y_true, y_pred, all_classes):
         }
 
     class_metrics = {}
-    support = {cls: y_true_pos.count(cls) for cls in positive_classes}
+    support = Counter(y_true_pos)
     for cls in positive_classes:
         y_true_binary = [1 if y == cls else 0 for y in y_true_pos]
         y_pred_binary = [1 if y == cls else 0 for y in y_pred_pos]
@@ -291,21 +288,35 @@ def compute_metrics_positive_macro(y_true, y_pred, all_classes):
             "recall": recall_score(y_true_binary, y_pred_binary, zero_division=0),
         }
 
-    # 计算混淆矩阵
-    cm = confusion_matrix(y_true_pos, y_pred_pos, labels=positive_classes)
+    macro_mcc = sum(class_metrics[c]["mcc"] for c in positive_classes) / len(
+            positive_classes
+        )
+    macro_f1 = sum(class_metrics[c]["f1"] for c in positive_classes) / len(
+        positive_classes
+    )
+    macro_precision = sum(
+        class_metrics[c]["precision"] for c in positive_classes
+    ) / len(positive_classes)
+    macro_recall = sum(class_metrics[c]["recall"] for c in positive_classes) / len(
+        positive_classes
+    )
 
     return {
-        "class_metrics": class_metrics,
-        # 'confusion_matrix': cm.tolist(),
-        # "support": support,
-        # "classes": positive_classes,
+        "mcc": macro_mcc,
+        "f1": macro_f1,
+        "precision": macro_precision,
+        "recall": macro_recall,
+        "per_class": class_metrics,
     }
 
 
 def compute_metrics_global_macro(y_true, y_pred, all_classes):
     """计算global-macro指标 (所有类别一视同仁)"""
+
     class_metrics = {}
-    support = {cls: y_true.count(cls) for cls in all_classes}
+
+    support = Counter(y_true)
+
     for cls in all_classes:
         y_true_binary = [1 if y == cls else 0 for y in y_true]
         y_pred_binary = [1 if y == cls else 0 for y in y_pred]
@@ -317,27 +328,48 @@ def compute_metrics_global_macro(y_true, y_pred, all_classes):
 
         precision = precision_score(y_true_binary, y_pred_binary, zero_division=0)
         recall = recall_score(y_true_binary, y_pred_binary, zero_division=0)
+        f1 = f1_score(y_true_binary, y_pred_binary, zero_division=0)
 
-        # FNR = 1 - recall, FPR = FP / (FP + TN)
+        # FPR
         tn = sum(
             1 for yt, yp in zip(y_true_binary, y_pred_binary) if yt == 0 and yp == 0
         )
         fp = sum(
             1 for yt, yp in zip(y_true_binary, y_pred_binary) if yt == 0 and yp == 1
         )
+
         fpr = fp / (fp + tn + 1e-8)
 
         class_metrics[cls] = {
             "mcc": mcc,
-            "f1": f1_score(y_true_binary, y_pred_binary, zero_division=0),
+            "f1": f1,
             "precision": precision,
-            "support": support[cls],
             "recall": recall,
+            "support": support[cls],
             "FNR": 1 - recall,
             "FPR": fpr,
         }
 
-    return class_metrics
+    macro_mcc = sum(class_metrics[c]["mcc"] for c in all_classes) / len(all_classes)
+    macro_f1 = sum(class_metrics[c]["f1"] for c in all_classes) / len(all_classes)
+    macro_precision = sum(class_metrics[c]["precision"] for c in all_classes) / len(
+        all_classes
+    )
+    macro_recall = sum(class_metrics[c]["recall"] for c in all_classes) / len(
+        all_classes
+    )
+    macro_fnr = sum(class_metrics[c]["FNR"] for c in all_classes) / len(all_classes)
+    macro_fpr = sum(class_metrics[c]["FPR"] for c in all_classes) / len(all_classes)
+
+    return {
+        "mcc": macro_mcc,
+        "f1": macro_f1,
+        "precision": macro_precision,
+        "recall": macro_recall,
+        "FNR": macro_fnr,
+        "FPR": macro_fpr,
+        "per_class": class_metrics,
+    }
 
 
 # ==================== 可视化函数 ====================
@@ -351,28 +383,23 @@ def plot_similarity_heatmap(
 
     plt.figure(figsize=(size, size))
 
-    # 确定数值范围用于颜色映射
-    sim_min = float(np.min(similarity_matrix))
-    sim_max = float(np.max(similarity_matrix))
-
     # 决定是否显示数值标注 (类别太多时关闭避免拥挤)
-    annot = n <= 20
-    fmt = ".0f" if annot else ""
-    annot_kws = {"size": 8} if annot else None
+    fmt = ".0f"
+    annot_kws = {"size": 12}
 
     # 绘制热力图
     ax = sns.heatmap(
         similarity_matrix * 100,
         xticklabels=labels,
         yticklabels=labels,
-        cmap="magma",
+        cmap="viridis",
         square=True,
-        annot=annot,
+        annot=True,
         fmt=fmt,
         annot_kws=annot_kws,
         vmin=-100,
         vmax=100,
-        center=0.0 if sim_min < 0 else 0.5,
+        center=0.0,
     )
 
     # 美化标签
@@ -386,7 +413,39 @@ def plot_similarity_heatmap(
 
     # 自动调整布局避免标签被截断
     plt.tight_layout()
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, bbox_inches="tight")
+    plt.close()
+
+
+def plot_margin_heatmap(margin_matrix, labels, title, x_title, y_title, save_path):
+    margin_matrix = margin_matrix.detach().cpu().numpy()
+    n = len(labels)
+    size = max(8, n * 0.6)
+    plt.figure(figsize=(size, size))
+    fmt = ".2f"
+    annot_kws = {"size": 12}
+    ax = sns.heatmap(
+        margin_matrix,
+        xticklabels=labels,
+        yticklabels=labels,
+        cmap="viridis",
+        square=True,
+        annot=True,
+        fmt=fmt,
+        annot_kws=annot_kws,
+        vmin=0,
+        vmax=np.pi,
+    )
+
+    plt.xticks(rotation=45, ha="right", fontsize=9)
+    plt.yticks(rotation=0, fontsize=9)
+
+    plt.title(title, fontsize=14, pad=20)
+    plt.xlabel(x_title, fontsize=11)
+    plt.ylabel(y_title, fontsize=11)
+
+    plt.tight_layout()
+    plt.savefig(save_path, bbox_inches="tight")
     plt.close()
 
 
@@ -399,7 +458,7 @@ def plot_umap(features, labels, all_classes, save_path):
     tsne = TSNE(n_components=2, random_state=42, perplexity=30, max_iter=1000)
     features_2d = tsne.fit_transform(features_np)
 
-    plt.figure(figsize=(12, 10))
+    plt.figure(figsize=(6, 5))
 
     # 颜色映射
     color_map = {}
@@ -420,8 +479,8 @@ def plot_umap(features, labels, all_classes, save_path):
                     features_2d[mask, 1],
                     c=[color_map[cls]],
                     label=cls,
-                    alpha=0.6,
-                    s=20,
+                    alpha=0.8,
+                    s=15,
                 )
 
     # 再绘制负样本点
@@ -437,8 +496,6 @@ def plot_umap(features, labels, all_classes, save_path):
         )
 
     plt.title("t-SNE Visualization of Features", fontsize=14)
-    plt.xlabel("t-SNE Dimension 1", fontsize=12)
-    plt.ylabel("t-SNE Dimension 2", fontsize=12)
     plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150)
@@ -447,6 +504,8 @@ def plot_umap(features, labels, all_classes, save_path):
 
 # ==================== 主训练函数 ====================
 def main():
+    set_seed(42)
+
     print(f"Using device: {DEVICE}")
     print(f"Dataset: {DATASET_NAME}/{DATASET_SUBSET}")
     print(f"Model: {MODEL_NAME}")
@@ -484,23 +543,6 @@ def main():
     train_dataset = VulnerabilityDataset(train_data_encoded, tokenizer, MAX_SEQ_LENGTH)
     val_dataset = VulnerabilityDataset(val_data_encoded, tokenizer, MAX_SEQ_LENGTH)
 
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-    )
-
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=False,
-        num_workers=NUM_WORKERS,
-        pin_memory=True,
-    )
-
     # 初始化模型
     model = AdaptiveSphereModel(MODEL_NAME, num_classes, HIDDEN_DIM)
     model = model.to(DEVICE)
@@ -521,6 +563,25 @@ def main():
     # 训练循环
     print("Starting training...")
     for epoch in range(MAX_EPOCHS):
+        g = torch.Generator()
+        g.manual_seed(SEED)
+        # 创建数据加载器
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            generator=g,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=True,
+        )
         # ========== 训练阶段 ==========
         model.train()
         train_loss = 0.0
@@ -715,7 +776,7 @@ def main():
                 "Classes",
                 os.path.join(
                     PROTOTYPE_DISPERSION_OUTPUT_DIR,
-                    f"geo_median_heatmap_epoch_{epoch+1}.png",
+                    f"geo_median_heatmap_epoch_{epoch+1}.svg",
                 ),
             )
 
@@ -737,7 +798,18 @@ def main():
                 f"Weight vs Geometric Median Prototype Similarity (Epoch {epoch+1})",
                 os.path.join(
                     PROTOTYPE_ALIGNMENT_OUTPUT_DIR,
-                    f"weight_vs_geo_heatmap_epoch_{epoch+1}.png",
+                    f"weight_vs_geo_heatmap_epoch_{epoch+1}.svg",
+                ),
+            )
+        if len(geo_proto_labels) > 0:
+            plot_margin_heatmap(
+                model.margin_matrix,
+                geo_proto_labels,
+                f"Adaptive Margin Matrix (Epoch {epoch+1})",
+                "Classes",
+                "Classes",
+                os.path.join(
+                    MARGIN_HEATMAP_OUTPUT_DIR, f"margin_heatmap_epoch_{epoch+1}.svg"
                 ),
             )
 
@@ -749,7 +821,7 @@ def main():
             all_features_concat,
             all_label_names_flat,
             all_labels,
-            os.path.join(UMAP_OUTPUT_DIR, f"umap_epoch_{epoch+1}.png"),
+            os.path.join(UMAP_OUTPUT_DIR, f"umap_epoch_{epoch+1}.svg"),
         )
 
         # ========== 早停检查 ==========
