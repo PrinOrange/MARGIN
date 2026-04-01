@@ -1,32 +1,26 @@
-from datetime import datetime
-import os
 import json
 import math
+import os
 import warnings
+from datetime import datetime
+
+import matplotlib.pyplot as plt
 import numpy as np
-from scipy.stats import chi2
-from sklearn.metrics import (
-    confusion_matrix,
-    f1_score,
-    matthews_corrcoef,
-    precision_score,
-    recall_score,
-    accuracy_score,
-)
+import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
-from torch.amp import autocast, GradScaler
-from transformers import RobertaModel, RobertaTokenizer, RobertaConfig
-from datasets import load_dataset
-from tqdm import tqdm
-from scipy.special import erfinv
-from scipy.optimize import minimize
-from scipy.stats import vonmises_fisher
-import seaborn as sns
-import matplotlib.pyplot as plt
 import umap
+from datasets import load_dataset
+from scipy.optimize import minimize
+from scipy.special import erfinv
+from scipy.stats import chi2, vonmises_fisher
+from sklearn.metrics import (accuracy_score, confusion_matrix, f1_score,
+                             matthews_corrcoef, precision_score, recall_score)
+from torch.amp import GradScaler, autocast
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+from transformers import RobertaConfig, RobertaModel, RobertaTokenizer
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -78,16 +72,22 @@ GEOMEDIAN_TOL = 1e-5
 
 
 # ==================== 工具函数 ====================
-def compute_vmf_kappa(r, d):
-    r = float(r)
-    r = min(max(r, 1e-6), 1 - 1e-8)
-    print("resultant:", r)
-    if r > 0.9:
-        return (d - 1) / (2 * (1 - r))
-    elif r > 0.5:
-        return r * (d - r**2) / (1 - r**2)
-    else:
-        return d * r
+def compute_vmf_kappa(mean_resultant_length, dim):
+    """
+    计算vMF分布的kappa参数 (MLE近似)
+    mean_resultant_length: ||r_bar||, 必须在[0,1]之间
+    dim: 维度d
+    """
+    r = mean_resultant_length
+    # 防止数值问题
+    r = torch.clamp(r, 0.0, 0.9999)
+    print("mean resultant length:", r)
+
+    numerator = r * (dim - r**2)
+    denominator = 1 - r**2
+
+    kappa = numerator / denominator
+    return torch.clamp(kappa, min=MIN_KAPPA) 
 
 
 def compute_pairwise_margin(kappa_i, kappa_j, dim, alpha=0.95):
@@ -284,17 +284,6 @@ class AdaptiveArcFaceLoss(nn.Module):
 
 
 # ==================== 评估指标计算 ====================
-# import numpy as np
-from sklearn.metrics import (
-    confusion_matrix,
-    matthews_corrcoef,
-    f1_score,
-    precision_score,
-    recall_score,
-    accuracy_score,
-)
-
-
 def compute_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
     """
     计算各类评估指标
@@ -397,19 +386,54 @@ def compute_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
     metrics["global_macro"]["fpr"] = float(np.mean(fpr_list))
 
     # =========================================================================
-    # 3. Positive Macro (排除 Non-vul，假设索引 0 为负例)
+    # 3. Positive Macro (排除 Non-vul，关注正样本内部的区分能力)
     # =========================================================================
     positive_label_idx = [l for l in all_label_idx if l != 0]
-
-    # 初始化 positive_macro 字典，防止后续赋值报错
     metrics["positive_macro"] = {"per_class": {}}
 
     if len(positive_label_idx) > 0:
-        # 计算 Positive 集合的平均指标
-        y_true_pos = [1 if y in positive_label_idx else 0 for y in truth_label_idx]
-        y_pred_pos = [1 if y in positive_label_idx else 0 for y in pred_label_idx]
+        # ---------------------------------------------------------------------
+        # 3.1 计算 Positive Macro MCC (修正版)
+        # ---------------------------------------------------------------------
+        # 逻辑：只在真实为正样本的数据中，计算每个类别的 One-vs-Rest MCC，然后取平均
+        
+        # 1. 筛选出所有真实为正样本的索引
+        pos_indices = [i for i, y in enumerate(truth_label_idx) if y in positive_label_idx]
+        
+        if len(pos_indices) > 0:
+            y_true_pos_subset = np.array([truth_label_idx[i] for i in pos_indices])
+            y_pred_pos_subset = np.array([pred_label_idx[i] for i in pos_indices])
+            
+            pos_mcc_scores = []
+            
+            # 2. 对每个正样本类别计算 One-vs-Rest MCC
+            for label_idx in positive_label_idx:
+                # 二值化：当前类为 1，其他正样本类为 0
+                y_true_binary = (y_true_pos_subset == label_idx).astype(int)
+                y_pred_binary = (y_pred_pos_subset == label_idx).astype(int)
+                
+                # 如果该类别在测试集中存在，则计算 MCC
+                if np.sum(y_true_binary) > 0:
+                    # 注意：这里不需要 zero_division 处理，因为 y_true 肯定有值
+                    # 但如果 y_pred 全为0或全为1，sklearn 可能会报错，需捕获
+                    try:
+                        mcc = matthews_corrcoef(y_true_binary, y_pred_binary)
+                        pos_mcc_scores.append(mcc)
+                    except ValueError:
+                        # 处理极端情况（如预测结果只有一类）
+                        pos_mcc_scores.append(0.0)
+                else:
+                    # 如果该类别没有真实样本，跳过或记为0
+                    pass
+            
+            # 3. 取平均
+            metrics["positive_macro"]["mcc"] = float(np.mean(pos_mcc_scores)) if pos_mcc_scores else 0.0
+        else:
+            metrics["positive_macro"]["mcc"] = 0.0
 
-        metrics["positive_macro"]["mcc"] = matthews_corrcoef(y_true_pos, y_pred_pos)
+        # ---------------------------------------------------------------------
+        # 3.2 计算其他指标 (F1, Precision, Recall) - 保持原有逻辑即可
+        # ---------------------------------------------------------------------
         metrics["positive_macro"]["f1"] = f1_score(
             truth_label_idx,
             pred_label_idx,
@@ -432,13 +456,14 @@ def compute_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
             zero_division=0,
         )
 
-        # 计算每个正例类别的详细指标 (包含 TP/FP/TN/FN)
+        # ---------------------------------------------------------------------
+        # 3.3 计算每个正例类别的详细指标
+        # ---------------------------------------------------------------------
         for label_idx in positive_label_idx:
             tp, fp, tn, fn = get_class_confusion_values(cm, label_idx)
             label_name = idx2label[label_idx]
             support = tp + fn
 
-            # 【关键修复】先将标签二值化，再计算指标
             y_true_binary = [1 if y == label_idx else 0 for y in truth_label_idx]
             y_pred_binary = [1 if y == label_idx else 0 for y in pred_label_idx]
 
@@ -453,7 +478,6 @@ def compute_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
                     **binary_metrics,
                 }
     else:
-        # 如果没有正例，填充默认值
         metrics["positive_macro"].update(
             {"mcc": 0.0, "f1": 0.0, "precision": 0.0, "recall": 0.0}
         )
