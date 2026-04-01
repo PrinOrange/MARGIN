@@ -91,7 +91,7 @@ class Trainer:
         self.id2label = id2label
         self.num_classes = len(label2id)
 
-        # 找出Non-vul的索引（假设为0或名称为'Non-vul'）
+        # 找出Non-vul的索引
         self.non_vul_idx = 0
         if "Non-vul" in label2id:
             self.non_vul_idx = label2id["Non-vul"]
@@ -108,45 +108,65 @@ class Trainer:
         self.patience_counter = 0
         self.best_model_state = None
 
-        # 存储每轮的原型
-        self.geometric_medians = None  # [C, D]
-
-    def compute_epoch_kappas(self, dataloader):
-        """计算每个类别的kappa值（基于训练集）"""
-        self.model.eval()
-        # 收集每个类别的特征
-        class_features = {i: [] for i in range(self.num_classes)}
+        # ========== 新增：运行时统计量 ==========
+        self.running_feature_sums = torch.zeros(
+            self.num_classes, EMBEDDING_DIM, device=DEVICE
+        )
+        self.class_counts = torch.zeros(self.num_classes, device=DEVICE)
+        # 初始化 geometric_medians 为 weight prototypes（归一化）
         with torch.no_grad():
-            for batch in tqdm(dataloader, desc="Computing kappas", leave=False):
-                input_ids = batch["input_ids"].to(DEVICE)
-                attention_mask = batch["attention_mask"].to(DEVICE)
-                labels = batch["label"].to(DEVICE)
+            weight_protos = self.model.get_weight_prototypes().detach()
+            self.geometric_medians = F.normalize(weight_protos, dim=1).clone()
+        # 初始化 kappas 为 1.0
+        self.kappas = {i: 1.0 for i in range(self.num_classes)}
 
-                _, features = self.model(
-                    input_ids, attention_mask, return_features=True
-                )
+    def reset_running_stats(self):
+        """每个 epoch 开始前重置统计量"""
+        self.running_feature_sums.zero_()
+        self.class_counts.zero_()
 
-                for i in range(len(labels)):
-                    label = labels[i].item()
-                    class_features[label].append(features[i].cpu())
-        # 计算每个类别的均值结果向量长度
-        kappas = {}
+    def update_running_stats(self, features: torch.Tensor, labels: torch.Tensor):
+        """在训练 batch 中更新 running feature sums 和 counts"""
+        features = F.normalize(features.detach(), dim=1)  # 球面特征
+        for i in range(len(labels)):
+            label = labels[i].item()
+            self.running_feature_sums[label] += features[i]
+            self.class_counts[label] += 1
+
+    def finalize_epoch_stats(self):
+        """在 epoch 结束时，用 running stats 计算 kappas 和 geometric medians"""
+        # 更新 geometric medians ≈ normalized class means
+        new_geometric_medians = torch.zeros_like(self.geometric_medians)
+        new_kappas = {}
+
         for class_idx in range(self.num_classes):
-            if len(class_features[class_idx]) > 0:
-                feats = torch.stack(class_features[class_idx])
-                feats = F.normalize(feats, dim=1)
-                # 计算均值向量
-                mean_vec = torch.mean(feats, dim=0)
-                r_bar = torch.norm(mean_vec).item()
-                # 计算kappa
-                kappa = compute_vmf_kappa(torch.tensor(r_bar), EMBEDDING_DIM)
-                kappas[class_idx] = kappa
+            count = self.class_counts[class_idx].item()
+            if count > 0:
+                mean_vec = self.running_feature_sums[class_idx] / count
+                norm_mean = torch.norm(mean_vec).item()
+                # 几何中位数近似为归一化均值方向
+                new_geometric_medians[class_idx] = F.normalize(mean_vec, dim=0)
+                # 计算 kappa
+                kappa = compute_vmf_kappa(torch.tensor(norm_mean), EMBEDDING_DIM)
+                kappa = max(kappa, MIN_KAPPA)
+                new_kappas[class_idx] = kappa
             else:
-                kappas[class_idx] = MIN_KAPPA
-        return kappas
+                # 如果该类本轮无样本，保留上一轮值（或初始化值）
+                new_geometric_medians[class_idx] = self.geometric_medians[class_idx]
+                new_kappas[class_idx] = self.kappas.get(class_idx, 1.0)
+
+        self.geometric_medians = new_geometric_medians
+        self.kappas = new_kappas
+
+        # 更新 criterion
+        self.criterion.update_kappas(self.kappas)
+        margins = self.compute_adaptive_margins(self.kappas)
+        scales = self.compute_adaptive_scales(self.kappas)
+        self.criterion.update_margins(margins)
+        self.criterion.update_scales(scales)
 
     def compute_adaptive_margins(self, kappas):
-        """基于kappas计算自适应margins"""
+        """保持不变"""
         margins = {}
         for i in range(self.num_classes):
             max_margin = 0.0
@@ -154,87 +174,36 @@ class Trainer:
                 if i != j:
                     kappa_i = max(kappas[i], MIN_KAPPA)
                     kappa_j = max(kappas[j], MIN_KAPPA)
-
                     delta_m = compute_pairwise_margin(
                         kappa_i, kappa_j, EMBEDDING_DIM, CONFIDENCE_ALPHA
                     )
                     max_margin = max(max_margin, delta_m)
-            margin_rad = max_margin
-            margin_rad = min(margin_rad, math.pi)
+            margin_rad = min(max_margin, math.pi)
             margins[i] = margin_rad
         return margins
 
     def compute_adaptive_scales(self, kappas: dict):
-        """
-        使用 scale[i] = BASE_SCALE * mean(kappas) / kappa[i]
-        kappas: dict {class_idx: kappa_value}
-        """
+        """保持不变"""
         scales = {}
         if not kappas:
             return scales
-
-        # 计算平均值
         kappa_mean = sum(kappas.values()) / len(kappas)
-
         for i in range(self.num_classes):
-            kappa = kappas.get(i, kappa_mean)  # 如果缺失，则使用平均值
-
-            # 避免除以 0
+            kappa = kappas.get(i, kappa_mean)
             if kappa <= 1e-6:
                 kappa = 1e-6
-
-            scale = BASE_SCALE * ((kappa_mean / kappa))
+            scale = BASE_SCALE * (kappa_mean / kappa)
             scales[i] = float(scale)
-
         return scales
 
-    def compute_geometric_median_prototypes(self, dataloader):
-        """计算几何中位数原型（基于训练集）"""
-        self.model.eval()
-
-        # 收集每个类别的特征
-        class_features = {i: [] for i in range(self.num_classes)}
-
-        with torch.no_grad():
-            for batch in tqdm(
-                dataloader, desc="Computing geometric medians", leave=False
-            ):
-                input_ids = batch["input_ids"].to(DEVICE)
-                attention_mask = batch["attention_mask"].to(DEVICE)
-                labels = batch["label"].to(DEVICE)
-
-                _, features = self.model(
-                    input_ids, attention_mask, return_features=True
-                )
-
-                for i in range(len(labels)):
-                    label = labels[i].item()
-                    class_features[label].append(features[i])
-
-        # 计算几何中位数
-        geometric_medians = torch.zeros(self.num_classes, EMBEDDING_DIM, device=DEVICE)
-
-        for class_idx in range(self.num_classes):
-            if len(class_features[class_idx]) > 0:
-                feats = torch.stack(class_features[class_idx])
-                median = compute_geometric_median(
-                    feats, GEOMEDIAN_MAX_ITER, GEOMEDIAN_TOL
-                )
-                geometric_medians[class_idx] = median
-            else:
-                # 如果没有样本，使用随机初始化
-                geometric_medians[class_idx] = F.normalize(
-                    torch.randn(EMBEDDING_DIM, device=DEVICE), p=2, dim=0
-                )
-
-        self.geometric_medians = geometric_medians
-        return geometric_medians
-
     def train_epoch(self, dataloader, epoch):
-        """训练一个epoch"""
+        """训练一个epoch，并在线更新统计量"""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
+
+        # 重置 running stats
+        self.reset_running_stats()
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training", leave=False)
         for batch in pbar:
@@ -244,18 +213,25 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            # 混合精度训练
             with autocast(DEVICE):
-                cos_theta = self.model(input_ids, attention_mask)
+                cos_theta, features = self.model(
+                    input_ids, attention_mask, return_features=True
+                )
                 loss = self.criterion(cos_theta, labels)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
+            # ========== 关键：更新 running stats ==========
+            self.update_running_stats(features, labels)
+
             total_loss += loss.item()
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        # ========== 在 epoch 结束时 finalize stats ==========
+        self.finalize_epoch_stats()
 
         return total_loss / num_batches
 
@@ -343,11 +319,11 @@ class Trainer:
         )
 
         # 绘制可视化
-        self.visualize_epoch(all_features, all_truth_label_idx, epoch, metrics)
+        self.visualize_epoch(all_features, all_truth_label_idx, epoch)
 
         return avg_loss, metrics
 
-    def visualize_epoch(self, features, labels, epoch, metrics):
+    def visualize_epoch(self, features, labels, epoch):
         """绘制热力图和UMAP"""
         import seaborn as sns
 
@@ -483,66 +459,75 @@ class Trainer:
             print(f"\n{'='*50}")
             print(f"Epoch {epoch}/{MAX_EPOCHS}")
             print(f"{'='*50}")
+            g = torch.Generator()
+            g.manual_seed(SEED)
+            train_loader = DataLoader(
+                self.train_dataset,
+                batch_size=BATCH_SIZE,
+                shuffle=True,
+                generator=g,
+                num_workers=4,
+                pin_memory=True,
+            )
+            val_loader = DataLoader(
+                self.val_dataset,
+                batch_size=BATCH_SIZE,
+                shuffle=False,
+                num_workers=4,
+                pin_memory=True,
+            )
 
-            # 1. 计算当前epoch的kappas（基于训练集）
-            kappas = self.compute_epoch_kappas(train_loader)
-            self.criterion.update_kappas(kappas)
-
-            # 2. 计算adaptive margins
-            margins = self.compute_adaptive_margins(kappas)
-            self.criterion.update_margins(margins)
-
-            # 3. 计算adaptive scales
-            scales = self.compute_adaptive_scales(kappas)
-            self.criterion.update_scales(scales)
-
-            # 打印当前margin和kappa
+            # 打印当前 margin 和 kappa（来自上一轮 finalize 的结果，首轮是初始值）
             print("\nClass-wise Kappa and Margin:")
             for i in range(self.num_classes):
+                margin = (
+                    self.criterion.margins[i]
+                    if hasattr(self.criterion, "margins")
+                    else 0.0
+                )
+                scale = (
+                    self.criterion.scales[i]
+                    if hasattr(self.criterion, "scales")
+                    else BASE_SCALE
+                )
                 print(
-                    f"  {self.id2label[i]}: κ={kappas[i]:.2f}, m={margins[i]}, s={scales[i]}"
+                    f"  {self.id2label[i]}: κ={self.kappas[i]:.2f}, m={margin:.4f}, s={scale:.2f}"
                 )
 
-            # 3. 训练
+            # 训练（内部已更新 stats）
             train_loss = self.train_epoch(train_loader, epoch)
             print(f"\nTrain Loss: {train_loss:.4f}")
 
-            # 4. 计算几何中位数原型（基于训练集）
-            self.compute_geometric_median_prototypes(train_loader)
-
-            # 5. 验证
+            # 注意：geometric_medians 已在 train_epoch 结尾更新，可直接用于 evaluate
             val_loss, metrics = self.evaluate(val_loader, epoch)
             print(f"Val Loss: {val_loss:.4f}")
 
-            # 6. 早停检查
+            # 早停逻辑不变
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.patience_counter = 0
-                # 保存最佳模型状态
                 self.best_model_state = {
                     "epoch": epoch,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "val_loss": val_loss,
-                    "kappas": kappas,
-                    "margins": margins,
+                    "kappas": self.kappas.copy(),
+                    "margins": (
+                        {i: self.criterion.margins[i] for i in range(self.num_classes)}
+                        if hasattr(self.criterion, "margins")
+                        else {}
+                    ),
                 }
-                # 保存到文件
-                # torch.save(
-                #     self.best_model_state, os.path.join(OUTPUT_DIR, "best_model.pt")
-                # )
                 print("Model improved, saved checkpoint.")
             else:
                 self.patience_counter += 1
                 print(
                     f"No improvement. Patience: {self.patience_counter}/{EARLY_STOPPING_PATIENCE}"
                 )
-
                 if self.patience_counter >= EARLY_STOPPING_PATIENCE:
                     print(f"\nEarly stopping triggered at epoch {epoch}")
                     break
 
-        # 加载最佳模型
         if self.best_model_state is not None:
             print(f"\nLoading best model from epoch {self.best_model_state['epoch']}")
             self.model.load_state_dict(self.best_model_state["model_state_dict"])
@@ -588,26 +573,7 @@ def main():
 
     # 训练
     trainer = Trainer(model, train_dataset, val_dataset, label2id, id2label)
-    trained_model = trainer.train()
-
-    # 最终测试
-    print("\n" + "=" * 50)
-    print("Final Testing")
-    print("=" * 50)
-    test_dataset = CodeDataset(test_hf, tokenizer)
-    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
-
-    # 使用训练集重新计算几何中位数用于测试
-    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
-    trainer.compute_geometric_median_prototypes(train_loader)
-
-    _, test_metrics = trainer.evaluate(test_loader, epoch="final", save_prefix="test")
-
-    print("\nFinal Test Results:")
-    print(f"Binary MCC: {test_metrics['binary']['mcc']:.4f}")
-    print(f"Global Macro F1: {test_metrics['global_macro']['f1']:.4f}")
-
-    print(f"\nAll outputs saved to: {OUTPUT_DIR}")
+    trainer.train()
 
 
 if __name__ == "__main__":

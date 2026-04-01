@@ -50,7 +50,7 @@ def compute_pairwise_margin(kappa_i, kappa_j, dim, alpha=0.95):
     q = chi2.ppf(alpha, df=dim - 1)
     sqrt_q = math.sqrt(q)  # 关键修正！
 
-    return 0.5 * sqrt_q * (term_j)  # 返回弧度
+    return 0.5 * sqrt_q * (term_i)  # 返回弧度
 
 
 def compute_geometric_median(features, max_iter, tol):
