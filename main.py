@@ -185,7 +185,7 @@ class Trainer:
             if kappa <= 1e-6:
                 kappa = 1e-6
 
-            scale = base_scale * (kappa_mean / kappa)
+            scale = base_scale * (1 - (kappa / kappa_mean))
             scales[i] = float(scale)
 
         return scales
