@@ -44,13 +44,11 @@ def compute_pairwise_margin(kappa_i, kappa_j, dim, alpha=0.95):
     计算两个类别之间的自适应margin Δm_{i,j}
     返回弧度值
     """
-    term_i = math.sqrt(1 / kappa_i)
+    q = chi2.ppf(2 * alpha - 1, df=dim - 1)
+    term_i = math.sqrt(q / kappa_i)
     term_j = math.sqrt(1 / kappa_j)
-
-    q = chi2.ppf(alpha, df=dim - 1)
-    sqrt_q = math.sqrt(q)  # 关键修正！
-
-    return 0.5 * sqrt_q * (term_i)  # 返回弧度
+    # return 0
+    return 0.5 * term_i  # 返回弧度
 
 
 def compute_geometric_median(features, max_iter, tol):

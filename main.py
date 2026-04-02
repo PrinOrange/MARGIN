@@ -3,28 +3,26 @@ import math
 import os
 import warnings
 from datetime import datetime
-
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-import umap
 from datasets import load_dataset
-from scipy.stats import chi2
 from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from transformers import RobertaModel, RobertaTokenizer
+from transformers import AutoTokenizer
 from utils.seed import set_seed
 from utils.metrics import compute_metrics
 from utils.dataset import CodeDataset
 from utils.model import MARGINLossHead, MARGINModel
 from utils.math import (
-    compute_geometric_median,
     compute_metrics,
     compute_pairwise_margin,
     compute_vmf_kappa,
+)
+from utils.visualize import (
+    draw_prototype_dispersion,
+    draw_prototype_alignment,
+    draw_umap,
 )
 
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -36,7 +34,7 @@ DATASET_SUBSET = "debug"  # 可选其他subset
 MAX_LENGTH = 512
 
 # 模型配置
-MODEL_NAME = "microsoft/graphcodebert-base"
+MODEL_NAME = "microsoft/unixcoder-base"
 EMBEDDING_DIM = 768  # graphcodebert-base的维度
 
 # 训练配置
@@ -82,19 +80,17 @@ set_seed(SEED)
 # ==================== 训练器 ====================
 class Trainer:
     def __init__(
-        self, model: MARGINModel, train_dataset, val_dataset, label2id, id2label
+        self, model: MARGINModel, train_dataset: CodeDataset, val_dataset: CodeDataset
     ):
         self.model = model.to(DEVICE)
         self.train_dataset = train_dataset
         self.val_dataset = val_dataset
-        self.label2id = label2id
-        self.id2label = id2label
-        self.num_classes = len(label2id)
+        self.label2id = train_dataset.label2id
+        self.id2label = train_dataset.id2label
+        self.num_classes = len(self.id2label)
 
         # 找出Non-vul的索引
         self.non_vul_idx = 0
-        if "Non-vul" in label2id:
-            self.non_vul_idx = label2id["Non-vul"]
 
         self.criterion: MARGINLossHead = MARGINLossHead(
             self.num_classes, BASE_SCALE
@@ -192,7 +188,8 @@ class Trainer:
             kappa = kappas.get(i, kappa_mean)
             if kappa <= 1e-6:
                 kappa = 1e-6
-            scale = BASE_SCALE * (kappa_mean / kappa)
+            scale = BASE_SCALE * (kappa / kappa_mean)
+            # scale = 30
             scales[i] = float(scale)
         return scales
 
@@ -319,124 +316,44 @@ class Trainer:
         )
 
         # 绘制可视化
-        self.visualize_epoch(all_features, all_truth_label_idx, epoch)
-
+        self.visualize_epoch(all_features, all_pred_label_idx, epoch)
         return avg_loss, metrics
 
-    def visualize_epoch(self, features, labels, epoch):
+    def visualize_epoch(self, features, truth_label_idx, epoch):
         """绘制热力图和UMAP"""
-        import seaborn as sns
-
-        sns.set_style("whitegrid")
 
         # 1. 几何中位数原型相似度热力图
-        if self.geometric_medians is not None:
-            geo_medians = self.geometric_medians.cpu().numpy()
-            sim_matrix = np.matmul(geo_medians, geo_medians.T)
-            # 转换为百分比
-            sim_matrix = (sim_matrix + 1) / 2 * 100  # 从[-1,1]映射到[0,100]
-            mask = np.triu(np.ones_like(sim_matrix, dtype=bool), k=1)
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(
-                sim_matrix,
-                annot=True,
-                mask=mask,
-                fmt=".0f",
-                cmap="YlOrRd",
-                vmin=0,
-                vmax=100,
-                xticklabels=[self.id2label[i] for i in range(self.num_classes)],
-                yticklabels=[self.id2label[i] for i in range(self.num_classes)],
-            )
-            plt.title(f"Geometric Median Prototype Similarity (%) - Epoch {epoch}")
-            plt.tight_layout()
-            plt.savefig(
-                os.path.join(
-                    PROTOTYPE_DISPERSION_OUTPUT_DIR, f"geo_median_sim_epoch_{epoch}.svg"
-                )
-            )
-            plt.close()
+        draw_prototype_dispersion(
+            self.geometric_medians,
+            self.id2label,
+            f"Geometric Median Prototype Similarity (%) - Epoch {epoch}",
+            os.path.join(
+                PROTOTYPE_DISPERSION_OUTPUT_DIR, f"geo_median_sim_epoch_{epoch}.svg"
+            ),
+        )
 
         # 2. Weight prototype与Geometric median prototype相似度热力图
-        weight_protos = self.model.get_weight_prototypes().detach()
-        if self.geometric_medians.detach() is not None:
-            sim_matrix = torch.matmul(self.geometric_medians.detach(), weight_protos.T)
-            sim_matrix = ((sim_matrix + 1) / 2 * 100).cpu().numpy()
-            plt.figure(figsize=(10, 8))
-            sns.heatmap(
-                sim_matrix,
-                annot=True,
-                fmt=".0f",
-                cmap="coolwarm",
-                vmin=0,
-                vmax=100,
-                xticklabels=[f"W-{self.id2label[i]}" for i in range(self.num_classes)],
-                yticklabels=[f"G-{self.id2label[i]}" for i in range(self.num_classes)],
-            )
-            plt.title(
-                f"Weight vs Geometric Median Prototype Similarity (%) - Epoch {epoch}"
-            )
-            plt.tight_layout()
-            plt.savefig(
-                os.path.join(
-                    PROTOTYPE_ALIGNMENT_OUTPUT_DIR, f"weight_geo_sim_epoch_{epoch}.svg"
-                )
-            )
-            plt.close()
+        draw_prototype_alignment(
+            self.geometric_medians,
+            self.model.get_weight_prototypes(),
+            self.id2label,
+            f"Weight vs Geometric Median Prototype Similarity (%) - Epoch {epoch}",
+            os.path.join(
+                PROTOTYPE_ALIGNMENT_OUTPUT_DIR, f"weight_geo_sim_epoch_{epoch}.svg"
+            ),
+        )
 
         # 3. UMAP可视化
-        reducer = umap.UMAP(
-            n_neighbors=UMAP_N_NEIGHBORS, min_dist=UMAP_MIN_DIST, random_state=SEED
+        draw_umap(
+            features,
+            truth_label_idx,
+            self.id2label,
+            f"UMAP Visualization - Epoch {epoch}",
+            os.path.join(UMAP_OUTPUT_DIR, f"umap_epoch_{epoch}.svg"),
+            UMAP_N_NEIGHBORS,
+            UMAP_MIN_DIST,
+            SEED,
         )
-        embedding = reducer.fit_transform(features)
-
-        plt.figure(figsize=(6, 5))
-
-        # 先画正样本（Non-vul为灰色，其他为有颜色）
-        unique_labels = sorted(set(labels))
-
-        # 定义颜色：Non-vul为灰色，其他为tab10
-        colors = plt.cm.tab10(np.linspace(0, 1, len(unique_labels) - 1))
-        color_map = {}
-        idx = 0
-        for label in unique_labels:
-            if label == self.non_vul_idx:
-                color_map[label] = "gray"
-            else:
-                color_map[label] = colors[idx % len(colors)]
-                idx += 1
-
-        # 后画负样本（Non-vul）
-        mask = np.array(labels) == self.non_vul_idx
-        plt.scatter(
-            embedding[mask, 0],
-            embedding[mask, 1],
-            c="gray",
-            label=self.id2label.get(self.non_vul_idx, "Non-vul"),
-            alpha=0.3,
-            s=30,
-            edgecolors="none",
-        )
-
-        # 先画正样本（非Non-vul）
-        for label in unique_labels:
-            if label != self.non_vul_idx:
-                mask = np.array(labels) == label
-                plt.scatter(
-                    embedding[mask, 0],
-                    embedding[mask, 1],
-                    c=[color_map[label]],
-                    label=self.id2label[label],
-                    alpha=0.9,
-                    s=20,
-                    edgecolors="none",
-                )
-
-        plt.legend(loc="best", fontsize=8)
-        plt.title(f"UMAP Visualization - Epoch {epoch}")
-        plt.tight_layout()
-        plt.savefig(os.path.join(UMAP_OUTPUT_DIR, f"umap_epoch_{epoch}.svg"))
-        plt.close()
 
     def train(self):
         """主训练循环"""
@@ -551,15 +468,13 @@ def main():
 
     # 初始化tokenizer
     print(f"Loading tokenizer and model: {MODEL_NAME}")
-    tokenizer = RobertaTokenizer.from_pretrained(MODEL_NAME)
 
     # 创建数据集
-    train_dataset = CodeDataset(train_hf, tokenizer, MAX_LENGTH)
-    val_dataset = CodeDataset(val_hf, tokenizer, MAX_LENGTH)
+    train_dataset = CodeDataset(MODEL_NAME, train_hf, MAX_LENGTH)
+    val_dataset = CodeDataset(MODEL_NAME, val_hf, MAX_LENGTH)
 
     # 构建标签映射（确保所有数据集使用相同映射）
     label2id = train_dataset.label2id
-    id2label = train_dataset.id2label
 
     print(f"Number of classes: {len(label2id)}")
     print(f"Label mapping: {label2id}")
@@ -572,7 +487,7 @@ def main():
     )
 
     # 训练
-    trainer = Trainer(model, train_dataset, val_dataset, label2id, id2label)
+    trainer = Trainer(model, train_dataset, val_dataset)
     trainer.train()
 
 

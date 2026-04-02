@@ -1,14 +1,14 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import RobertaModel
+from transformers import AutoModelForTextEncoding
 
 
 # ==================== 模型定义 ====================
 class MARGINModel(nn.Module):
     def __init__(self, num_classes, backbone: str, embedding_dim: int):
         super().__init__()
-        self.roberta = RobertaModel.from_pretrained(backbone)
+        self.roberta = AutoModelForTextEncoding.from_pretrained(backbone)
         self.num_classes = num_classes
 
         # Weight prototypes (已归一化)
