@@ -38,7 +38,7 @@ def draw_prototype_alignment(
     filepath: str,
 ):
     weight_protos = weight_prototypes.detach()
-    sim_matrix = torch.matmul(geometric_median_prototypes.detach(), weight_protos.T)
+    sim_matrix = torch.matmul(geometric_median_prototypes.detach(), weight_protos.t())
     sim_matrix = (sim_matrix * 100).cpu().numpy()
     plt.figure(figsize=(10, 8))
     sns.heatmap(

@@ -1,5 +1,4 @@
 import json
-import math
 import os
 import warnings
 from datetime import datetime
@@ -10,12 +9,10 @@ from torch.amp import GradScaler, autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils.seed import set_seed
-from utils.metrics import compute_metrics
 from utils.dataset import CodeDataset
 from utils.model import MARGINLossHead, MARGINModel
 from utils.math import (
-    compute_metrics,
-    compute_pairwise_margin,
+    compute_geometric_median,
     compute_vmf_kappa,
 )
 from utils.visualize import (
@@ -23,6 +20,7 @@ from utils.visualize import (
     draw_prototype_alignment,
     draw_umap,
 )
+from utils.evaluation import evaluate_model
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -74,28 +72,15 @@ set_seed(SEED)
 
 # ==================== 训练器 ====================
 class Trainer:
-    def __init__(
-        self, model: MARGINModel, train_dataset: CodeDataset, val_dataset: CodeDataset
-    ):
+    def __init__(self, model: MARGINModel):
         self.model = model.to(DEVICE)
-        self.train_dataset = train_dataset
-        self.val_dataset = val_dataset
-        self.label2id = train_dataset.label2id
-        self.id2label = train_dataset.id2label
-        self.num_classes = len(self.id2label)
 
-        # 找出Non-vul的索引
-        self.non_vul_idx = 0
-
-        self.criterion: MARGINLossHead = MARGINLossHead(
-            self.num_classes
+        self.classification_loss: MARGINLossHead = MARGINLossHead(
+            self.model.num_classes,
+            BASE_SCALE,
+            CONFIDENCE_ALPHA,
+            self.model.embedding_dim,
         ).to(DEVICE)
-
-        # ========== 新增：运行时统计量 ==========
-        self.running_feature_sums = torch.zeros(
-            self.num_classes, EMBEDDING_DIM, device=DEVICE
-        )
-        self.class_counts = torch.zeros(self.num_classes, device=DEVICE)
 
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
@@ -106,97 +91,19 @@ class Trainer:
         self.patience_counter = 0
         self.best_model_state = None
 
-        # 初始化 geometric_medians 为 weight prototypes（归一化）
-        with torch.no_grad():
-            weight_protos = self.model.get_weight_prototypes().detach()
-            self.geometric_medians = F.normalize(weight_protos, dim=1).clone()
-        # 初始化 kappas 为 1.0
-        self.kappas = {i: 1.0 for i in range(self.num_classes)}
-
-    def compute_adaptive_margins(self, kappas):
-        """保持不变"""
-        margins = {}
-        for i in range(self.num_classes):
-            max_margin = 0.0
-            for j in range(self.num_classes):
-                if i != j:
-                    kappa_i = max(kappas[i], MIN_KAPPA)
-                    kappa_j = max(kappas[j], MIN_KAPPA)
-                    delta_m = compute_pairwise_margin(
-                        kappa_i, kappa_j, EMBEDDING_DIM, CONFIDENCE_ALPHA
-                    )
-                    max_margin = max(max_margin, delta_m)
-            margin_rad = min(max_margin, math.pi)
-            margins[i] = margin_rad
-        return margins
-
-    def compute_adaptive_scales(self, kappas: dict):
-        """保持不变"""
-        scales = {}
-        if not kappas:
-            return scales
-        kappa_mean = sum(kappas.values()) / len(kappas)
-        for i in range(self.num_classes):
-            kappa = kappas.get(i, kappa_mean)
-            if kappa <= 1e-6:
-                kappa = 1e-6
-            scale = BASE_SCALE * (kappa / kappa_mean)
-            # scale = 30
-            scales[i] = float(scale)
-        return scales
-
-    def update_running_stats(self, features: torch.Tensor, labels: torch.Tensor):
-        """在训练 batch 中更新 running feature sums 和 counts"""
-        features = F.normalize(features.detach(), dim=1)  # 球面特征
-        for i in range(len(labels)):
-            label = labels[i].item()
-            self.running_feature_sums[label] += features[i]
-            self.class_counts[label] += 1
-    
-    def finalize_epoch_stats(self):
-        """在 epoch 结束时，用 running stats 计算 kappas 和 geometric medians"""
-        # 更新 geometric medians ≈ normalized class means
-        new_geometric_medians = torch.zeros_like(self.geometric_medians)
-        new_kappas = {}
-
-        for class_idx in range(self.num_classes):
-            count = self.class_counts[class_idx].item()
-            if count > 0:
-                mean_vec = self.running_feature_sums[class_idx] / count
-                norm_mean = torch.norm(mean_vec).item()
-                # 几何中位数近似为归一化均值方向
-                new_geometric_medians[class_idx] = F.normalize(mean_vec, dim=0)
-                # 计算 kappa
-                kappa = compute_vmf_kappa(torch.tensor(norm_mean), EMBEDDING_DIM)
-                kappa = max(kappa, MIN_KAPPA)
-                new_kappas[class_idx] = kappa
-            else:
-                # 如果该类本轮无样本，保留上一轮值（或初始化值）
-                new_geometric_medians[class_idx] = self.geometric_medians[class_idx]
-                new_kappas[class_idx] = self.kappas.get(class_idx, 1.0)
-
-        self.geometric_medians = new_geometric_medians
-        self.kappas = new_kappas
-
-        # 更新 criterion
-        margins = self.compute_adaptive_margins(self.kappas)
-        scales = self.compute_adaptive_scales(self.kappas)        
-
-        self.criterion.update_kappas(self.kappas)
-        self.criterion.update_margins(margins)
-        self.criterion.update_scales(scales)
-
-    def train_epoch(self, dataloader, epoch):
-        """训练一个epoch，并在线更新统计量"""
+    def train_epoch(self, dataloader, epoch, geometric_median_max_iter=100):
+        """训练一个epoch，同时计算 mean prototype、geometric median prototype 和每个类别的 kappa"""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
+
+        feature_accumulator = {label: [] for label in range(self.model.num_classes)}
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training", leave=False)
         for batch in pbar:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
-            labels = batch["label"].to(DEVICE)
+            label_idxs = batch["label_idx"].to(DEVICE)
 
             self.optimizer.zero_grad()
 
@@ -204,70 +111,85 @@ class Trainer:
                 cos_theta, features = self.model(
                     input_ids, attention_mask, return_features=True
                 )
-                loss = self.criterion(cos_theta, labels)
+                loss = self.classification_loss(cos_theta, label_idxs)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            # ========== 关键：更新 running stats ==========
-            self.update_running_stats(features, labels)
             total_loss += loss.item()
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-        self.finalize_epoch_stats()
+
+            # 积累 features
+            features_cpu = features.detach().cpu()
+            labels_cpu = label_idxs.detach().cpu()
+            for f, l in zip(features_cpu, labels_cpu):
+                feature_accumulator[int(l)].append(f)
+
+        # 特征维度 & 类别数
+        D = features.shape[1]
+        C = self.model.num_classes
+
+        mean_prototypes_list = []
+        geom_median_prototypes_list = []
+        kappas_list = []
+
+        for label_idx in range(C):
+            feats = feature_accumulator[label_idx]
+            if len(feats) == 0:
+                mean_prototypes_list.append(torch.zeros(D))
+                geom_median_prototypes_list.append(torch.zeros(D))
+                kappas_list.append(torch.tensor(0.0))  # 没有样本，kappa = 0
+                continue
+
+            feats_tensor = torch.stack(feats, dim=0)  # [N, D]
+
+            # mean prototype
+            mean_proto = feats_tensor.mean(dim=0)
+            mean_prototypes_list.append(mean_proto)
+
+            # geometric median prototype
+            feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=0)
+            geom_median_proto = compute_geometric_median(
+                feats_tensor_norm, max_iter=geometric_median_max_iter
+            )
+            geom_median_prototypes_list.append(geom_median_proto)
+
+            # kappa
+            feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=0)  # [N, D]
+            kappa = compute_vmf_kappa(feats_tensor_norm, D)
+            kappas_list.append(kappa)
+
+        # 拼成 [D, C] 张量
+        self.model.current_mean_prototypes = torch.stack(
+            mean_prototypes_list, dim=0
+        ).to(DEVICE)
+        self.model.current_geometric_median_prototypes = torch.stack(
+            geom_median_prototypes_list, dim=0
+        ).to(DEVICE)
+        self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
+
+        self.classification_loss.update_adaptive_params(
+            self.model.current_kappas, self.model.current_mean_prototypes
+        )
+
         return total_loss / num_batches
 
-    def evaluate(self, dataloader, epoch, save_prefix="val"):
+    def evaluate_epoch(self, dataloader, epoch, save_prefix="val"):
         """评估模型"""
         self.model.eval()
 
-        all_pred_label_idx = []
-        all_truth_label_idx = []
-        all_features = []
-        all_raw_labels = []
-
-        total_loss = 0.0
-        num_batches = 0
-
-        with torch.no_grad():
-            pbar = tqdm(dataloader, desc=f"Epoch {epoch} Evaluating", leave=False)
-            for batch in pbar:
-                input_ids = batch["input_ids"].to(DEVICE)
-                attention_mask = batch["attention_mask"].to(DEVICE)
-                labels = batch["label"].to(DEVICE)
-
-                # 使用几何中位数原型进行分类
-                _, features = self.model(
-                    input_ids, attention_mask, return_features=True
-                )
-
-                # 计算与几何中位数原型的余弦相似度
-                sim = torch.matmul(features, self.geometric_medians.t())
-                preds = torch.argmax(sim, dim=1)
-
-                # 计算loss（用于早停）
-                with autocast(DEVICE):
-                    cos_theta = self.model(input_ids, attention_mask)
-                    loss = self.criterion(cos_theta, labels)
-
-                total_loss += loss.item()
-                num_batches += 1
-                pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-                all_pred_label_idx.extend(preds.cpu().numpy())
-                all_truth_label_idx.extend(labels.cpu().numpy())
-                all_features.append(features.cpu())
-                all_raw_labels.extend(batch["raw_label"])
-
-        avg_loss = total_loss / num_batches
-        all_features = torch.cat(all_features, dim=0).numpy()
-
-        # 计算指标
-        metrics = compute_metrics(
-            all_truth_label_idx, all_pred_label_idx, self.id2label
+        (
+            metrics,
+            all_features,
+            all_truth_label_idx,
+            all_pred_label_idx,
+            all_raw_labels,
+            avg_loss,
+        ) = evaluate_model(
+            self.model.eval(), dataloader, f"Epoch {epoch} Evaluating", DEVICE
         )
-        metrics["val_loss"] = avg_loss
 
         # 保存到JSON
         json_path = os.path.join(
@@ -305,8 +227,8 @@ class Trainer:
 
         # 1. 几何中位数原型相似度热力图
         draw_prototype_dispersion(
-            self.geometric_medians,
-            self.id2label,
+            self.model.current_geometric_median_prototypes,
+            self.model.id2label,
             f"Geometric Median Prototype Similarity (%) - Epoch {epoch}",
             os.path.join(
                 PROTOTYPE_DISPERSION_OUTPUT_DIR, f"geo_median_sim_epoch_{epoch}.svg"
@@ -315,9 +237,9 @@ class Trainer:
 
         # 2. Weight prototype与Geometric median prototype相似度热力图
         draw_prototype_alignment(
-            self.geometric_medians,
+            self.model.current_geometric_median_prototypes,
             self.model.get_weight_prototypes(),
-            self.id2label,
+            self.model.id2label,
             f"Weight vs Geometric Median Prototype Similarity (%) - Epoch {epoch}",
             os.path.join(
                 PROTOTYPE_ALIGNMENT_OUTPUT_DIR, f"weight_geo_sim_epoch_{epoch}.svg"
@@ -328,7 +250,7 @@ class Trainer:
         draw_umap(
             features,
             truth_label_idx,
-            self.id2label,
+            self.model.id2label,
             f"UMAP Visualization - Epoch {epoch}",
             os.path.join(UMAP_OUTPUT_DIR, f"umap_epoch_{epoch}.svg"),
             UMAP_N_NEIGHBORS,
@@ -337,22 +259,6 @@ class Trainer:
         )
 
     def train(self):
-        """主训练循环"""
-        train_loader = DataLoader(
-            self.train_dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=True,
-        )
-        val_loader = DataLoader(
-            self.val_dataset,
-            batch_size=BATCH_SIZE,
-            shuffle=False,
-            num_workers=4,
-            pin_memory=True,
-        )
-
         for epoch in range(1, MAX_EPOCHS + 1):
             print(f"\n{'='*50}")
             print(f"Epoch {epoch}/{MAX_EPOCHS}")
@@ -360,7 +266,7 @@ class Trainer:
             g = torch.Generator()
             g.manual_seed(SEED)
             train_loader = DataLoader(
-                self.train_dataset,
+                self.model.train_dataset,
                 batch_size=BATCH_SIZE,
                 shuffle=True,
                 generator=g,
@@ -368,7 +274,7 @@ class Trainer:
                 pin_memory=True,
             )
             val_loader = DataLoader(
-                self.val_dataset,
+                self.model.val_dataset,
                 batch_size=BATCH_SIZE,
                 shuffle=False,
                 num_workers=4,
@@ -377,19 +283,19 @@ class Trainer:
 
             # 打印当前 margin 和 kappa（来自上一轮 finalize 的结果，首轮是初始值）
             print("\nClass-wise Kappa and Margin:")
-            for i in range(self.num_classes):
+            for i in range(self.model.num_classes):
                 margin = (
-                    self.criterion.margins[i]
-                    if hasattr(self.criterion, "margins")
+                    self.classification_loss.margins[i]
+                    if hasattr(self.classification_loss, "margins")
                     else 0.0
                 )
                 scale = (
-                    self.criterion.scales[i]
-                    if hasattr(self.criterion, "scales")
+                    self.classification_loss.scales[i]
+                    if hasattr(self.classification_loss, "scales")
                     else BASE_SCALE
                 )
                 print(
-                    f"  {self.id2label[i]}: κ={self.kappas[i]:.2f}, m={margin:.4f}, s={scale:.2f}"
+                    f"  {self.model.id2label[i]}: κ={self.model.current_kappas[i]:.2f}, m={margin:.4f}, s={scale:.2f}"
                 )
 
             # 训练（内部已更新 stats）
@@ -397,7 +303,7 @@ class Trainer:
             print(f"\nTrain Loss: {train_loss:.4f}")
 
             # 注意：geometric_medians 已在 train_epoch 结尾更新，可直接用于 evaluate
-            val_loss, metrics = self.evaluate(val_loader, epoch)
+            val_loss, metrics = self.evaluate_epoch(val_loader, epoch)
             print(f"Val Loss: {val_loss:.4f}")
 
             # 早停逻辑不变
@@ -409,11 +315,12 @@ class Trainer:
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
                     "val_loss": val_loss,
-                    "kappas": self.kappas.copy(),
+                    "kappas": self.model.current_kappas.clone(),
                     "margins": (
-                        {i: self.criterion.margins[i] for i in range(self.num_classes)}
-                        if hasattr(self.criterion, "margins")
-                        else {}
+                        {
+                            i: self.classification_loss.margins[i]
+                            for i in range(self.model.num_classes)
+                        }
                     ),
                 }
                 print("Model improved, saved checkpoint.")
@@ -455,20 +362,22 @@ def main():
     val_dataset = CodeDataset(MODEL_NAME, val_hf, MAX_LENGTH)
 
     # 构建标签映射（确保所有数据集使用相同映射）
-    label2id = train_dataset.label2id
+    label2id = train_dataset.label2idx
 
     print(f"Number of classes: {len(label2id)}")
     print(f"Label mapping: {label2id}")
 
     # 初始化模型
     model = MARGINModel(
-        num_classes=len(label2id),
         backbone=MODEL_NAME,
-        embedding_dim=EMBEDDING_DIM,
+        base_scale=BASE_SCALE,
+        alpha=CONFIDENCE_ALPHA,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
     )
 
     # 训练
-    trainer = Trainer(model, train_dataset, val_dataset)
+    trainer = Trainer(model)
     trainer.train()
 
 

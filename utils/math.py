@@ -1,57 +1,61 @@
-import json
 import math
-import os
-import warnings
-from datetime import datetime
-
-import matplotlib.pyplot as plt
-import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
-from datasets import load_dataset
 from scipy.stats import chi2
-from torch.amp import GradScaler, autocast
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers import RobertaModel, RobertaTokenizer
-from utils.seed import set_seed
-from utils.metrics import compute_metrics
-from utils.dataset import CodeDataset
-from utils.model import MARGINLossHead, MARGINModel
 
 
-def compute_vmf_kappa(mean_resultant_length, dim):
+def compute_vmf_kappa(features: torch.Tensor, dim: int):
     """
-    计算vMF分布的kappa参数 (MLE近似)
-    mean_resultant_length: ||r_bar||, 必须在[0,1]之间
-    dim: 维度d
+    计算 vMF 分布的 kappa 参数（MLE 近似）
+    features: [N, D] 已归一化特征
+    dim: 维度 D
+    返回: kappa tensor，标量形式
     """
-    r = mean_resultant_length
+    # mean resultant vector
+    r_bar_vec = features.mean(dim=0)  # [D]
+    r = r_bar_vec.norm(p=2)  # 标量 ||r_bar||
+
     # 防止数值问题
     r = torch.clamp(r, 0.0, 0.9999)
-    print("mean resultant length:", r)
 
     numerator = r * (dim - r**2)
     denominator = 1 - r**2
 
     kappa = numerator / denominator
-    return torch.clamp(kappa, min=1)
+    kappa = torch.clamp(kappa, min=1.0)  # 保证最小为1
+
+    return kappa
 
 
-def compute_pairwise_margin(kappa_i, kappa_j, dim, alpha=0.95):
+def compute_pairwise_margin(
+    mu_i: torch.Tensor, kappa_i: float, mu_j: torch.Tensor, kappa_j: float, alpha=0.95
+):
     """
-    计算两个类别之间的自适应margin Δm_{i,j}
-    返回弧度值
+    计算两个类别之间的自适应 margin Δm_{i,j} (弧度)
+    mu_i, mu_j: 未归一化向量 [embedding_dim]
+    kappa_i, kappa_j: 对应类别的 κ
     """
+    # 归一化向量
+    mu_i = F.normalize(mu_i, dim=0)
+    mu_j = F.normalize(mu_j, dim=0)
+
+    dim = mu_i.size(0)
+    # 球冠半径近似 (chi2 或高维近似)
     q = chi2.ppf(2 * alpha - 1, df=dim - 1)
     term_i = math.sqrt(q / kappa_i)
-    term_j = math.sqrt(1 / kappa_j)
-    # return 0
-    return 0.5 * term_i  # 返回弧度
+    term_j = math.sqrt(q / kappa_j)
+
+    # 中心夹角
+    cos_theta = torch.dot(mu_i, mu_j).clamp(-1.0, 1.0)
+    theta_ij = torch.acos(cos_theta)
+
+    # 最大 overlap 角度
+    theta_overlap = max(0.0, term_i + term_j - theta_ij.item())
+
+    return theta_overlap
 
 
-def compute_geometric_median(features, max_iter, tol = 1e-5):
+def compute_geometric_median(features, max_iter, tol=1e-5):
     """
     在单位超球面上计算几何中位数
     features: [N, D] 已归一化的特征
