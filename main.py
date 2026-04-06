@@ -35,7 +35,7 @@ MODEL_NAME = "microsoft/unixcoder-base"
 EMBEDDING_DIM = 768  # graphcodebert-base的维度
 
 # 训练配置
-BATCH_SIZE = 128
+BATCH_SIZE = 32
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 MAX_EPOCHS = 200
@@ -43,7 +43,7 @@ EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 SCHEDULER_PATIENCE = 3
 
 # ArcFace & 球面配置
-BASE_SCALE = 30.0  # s
+BASE_SCALE = 10.0  # s
 CONFIDENCE_ALPHA = 0.95  # α
 MIN_KAPPA = 1.0  # 防止kappa过小导致数值不稳定
 SEED = 42
@@ -92,11 +92,11 @@ class Trainer:
         self.best_model_state = None
 
     def train_epoch(self, dataloader, epoch, geometric_median_max_iter=100):
-        """训练一个epoch，同时计算 mean prototype、geometric median prototype 和每个类别的 kappa"""
         self.model.train()
         total_loss = 0.0
         num_batches = 0
 
+        # 或者，如果显存允许，可以直接存 Tensor 列表
         feature_accumulator = {label: [] for label in range(self.model.num_classes)}
 
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training", leave=False)
@@ -120,58 +120,97 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-
-            # 积累 features
             features_cpu = features.detach().cpu()
             labels_cpu = label_idxs.detach().cpu()
             for f, l in zip(features_cpu, labels_cpu):
                 feature_accumulator[int(l)].append(f)
 
-        # 特征维度 & 类别数
+        # --- 统计阶段优化 ---
+
         D = features.shape[1]
         C = self.model.num_classes
 
         mean_prototypes_list = []
         geom_median_prototypes_list = []
         kappas_list = []
+        class_counts_list = []
 
+        # 预分配张量列表，避免动态扩容
         for label_idx in range(C):
             feats = feature_accumulator[label_idx]
+
+            # 处理空类别
             if len(feats) == 0:
                 mean_prototypes_list.append(torch.zeros(D))
                 geom_median_prototypes_list.append(torch.zeros(D))
-                kappas_list.append(torch.tensor(0.0))  # 没有样本，kappa = 0
+                kappas_list.append(torch.tensor(0.0))
+                class_counts_list.append(0)
                 continue
 
+            # 1. 一次性堆叠，效率更高
             feats_tensor = torch.stack(feats, dim=0)  # [N, D]
+            class_counts_list.append(len(feats))  # 记录实际参与训练的样本数
 
-            # mean prototype
-            mean_proto = feats_tensor.mean(dim=0)
+            # 2. 只进行一次归一化，复用结果
+            # 注意：geometric median 和 kappa 计算通常都需要单位向量
+            feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=0)
+
+            # Mean Prototype (在归一化前或后计算取决于你的定义，通常 Mean of Normals 是标准做法)
+            mean_proto = feats_tensor_norm.mean(dim=0)
             mean_prototypes_list.append(mean_proto)
 
-            # geometric median prototype
-            feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=0)
+            # Geometric Median Prototype
             geom_median_proto = compute_geometric_median(
                 feats_tensor_norm, max_iter=geometric_median_max_iter
             )
             geom_median_prototypes_list.append(geom_median_proto)
 
-            # kappa
-            feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=0)  # [N, D]
+            # Kappa (复用上面的 feats_tensor_norm)
             kappa = compute_vmf_kappa(feats_tensor_norm, D)
             kappas_list.append(kappa)
 
-        # 拼成 [D, C] 张量
+        # 拼成 [C, D] 张量 (注意维度顺序，通常类别在前更方便索引)
         self.model.current_mean_prototypes = torch.stack(
             mean_prototypes_list, dim=0
         ).to(DEVICE)
+
         self.model.current_geometric_median_prototypes = torch.stack(
             geom_median_prototypes_list, dim=0
         ).to(DEVICE)
-        self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
 
+        self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
+        self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
+
+        # 1. 将列表转为 Tensor，方便计算
+        current_kappas_tensor = torch.stack(kappas_list).to(DEVICE) # [C]
+
+        # 2. 获取模型中存储的历史 EMA Kappa
+        # 注意：第一次运行时，model.current_kappas 可能是 None 或初始值，需要处理
+        if self.model.current_kappas is None:
+            # 如果是第一次，直接使用当前值（或者全1初始化）
+            smoothed_kappas = current_kappas_tensor
+        else:
+            # 3. 定义 EMA 动量系数 (Momentum)
+            # 这是一个超参数，通常设为 0.9, 0.99, 0.999。值越大，历史权重越重，越平滑。
+            EMA_MOMENTUM = 0.999
+
+            # 4. 执行 EMA 更新公式
+            # smoothed = momentum * old + (1 - momentum) * new
+            smoothed_kappas = (
+                EMA_MOMENTUM * self.model.current_kappas 
+                + (1 - EMA_MOMENTUM) * current_kappas_tensor
+            )
+
+        # 5. 强制更新回模型属性
+        # 这一步替代了原来的直接赋值逻辑
+        self.model.current_kappas = smoothed_kappas
+
+
+        # 更新损失函数的自适应参数
         self.classification_loss.update_adaptive_params(
-            self.model.current_kappas, self.model.current_mean_prototypes
+            self.model.current_kappas,
+            self.model.class_counts,
+            self.model.current_mean_prototypes,
         )
 
         return total_loss / num_batches
@@ -284,16 +323,8 @@ class Trainer:
             # 打印当前 margin 和 kappa（来自上一轮 finalize 的结果，首轮是初始值）
             print("\nClass-wise Kappa and Margin:")
             for i in range(self.model.num_classes):
-                margin = (
-                    self.classification_loss.margins[i]
-                    if hasattr(self.classification_loss, "margins")
-                    else 0.0
-                )
-                scale = (
-                    self.classification_loss.scales[i]
-                    if hasattr(self.classification_loss, "scales")
-                    else BASE_SCALE
-                )
+                margin = self.classification_loss.margins[i]
+                scale = self.classification_loss.scales[i]
                 print(
                     f"  {self.model.id2label[i]}: κ={self.model.current_kappas[i]:.2f}, m={margin:.4f}, s={scale:.2f}"
                 )

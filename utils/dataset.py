@@ -1,14 +1,13 @@
+import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
 
-# ==================== 数据集类 ====================
 class CodeDataset(Dataset):
     def __init__(self, backbone: str, hf_dataset: str, max_length: int):
         self.dataset = hf_dataset
         self.tokenizer = AutoTokenizer.from_pretrained(backbone)
         self.max_length = max_length
-        # 构建标签映射
         self.label2idx = {}
         self.idx2label = {}
         self._build_label_mapping()

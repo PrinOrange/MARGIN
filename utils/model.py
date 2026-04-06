@@ -27,6 +27,7 @@ class MARGINModel(nn.Module):
         self.weight_prototypes = nn.Parameter(
             F.normalize(torch.randn(self.num_classes, self.embedding_dim), p=2, dim=1)
         )
+        self.class_counts = torch.zeros(self.num_classes)
         self.current_kappas = torch.zeros(self.num_classes)
         self.current_mean_prototypes = torch.zeros(self.num_classes, self.embedding_dim)
         self.current_geometric_median_prototypes = torch.zeros(
@@ -66,12 +67,15 @@ class MARGINLossHead(nn.Module):
         self.dim = dim
         self.alpha = alpha
 
-        self.register_buffer("margins", torch.ones(num_classes))
-        self.register_buffer("kappas", torch.ones(num_classes))
+        self.register_buffer("margins", torch.zeros(num_classes))
+        self.register_buffer("kappas", torch.zeros(num_classes))
         self.register_buffer("scales", torch.ones(num_classes))
 
     def update_adaptive_params(
-        self, kappas: torch.Tensor, mean_prototypes: torch.Tensor
+        self,
+        kappas: torch.Tensor,
+        class_counts: torch.Tensor,
+        mean_prototypes: torch.Tensor,
     ):
         """
         kappas: [C]
@@ -84,28 +88,37 @@ class MARGINLossHead(nn.Module):
         C = self.num_classes
         # --- 防止数值问题 ---
         kappas = torch.clamp(kappas, min=1e-6)
-        # --- 计算 scale ---
-        kappa_mean = kappas.mean()
-        scales = self.base_scale * (kappas / kappa_mean)
+        kappa_min = kappas.min()
+        kappa_max = kappas.max()
+        kappas_norm = (kappas - kappa_min) / (kappa_max - kappa_min + 1e-8)
+        scales_weight = (2 - kappas_norm)
+        scales = self.base_scale * scales_weight
         # 如果你想固定 scale
-        scales = torch.full_like(scales, 30.0)
+        # scales = torch.full_like(scales, 30.0)
+
         # --- 计算 margins ---
         margins = torch.zeros(C, device=device)
-
         for i in range(C):
             mu_i = mean_prototypes[i]
+            count_i = class_counts[i]
             kappa_i = torch.clamp(kappas[i], min=1.0)
-            max_margin = 0.0
             for j in range(C):
                 if i == j:
                     continue
                 mu_j = mean_prototypes[j]
+                count_j = class_counts[j]
                 kappa_j = torch.clamp(kappas[j], min=1.0)
                 delta_m = compute_pairwise_margin(
-                    mu_i, kappa_i, mu_j, kappa_j
+                    self.num_classes,
+                    mu_i,
+                    count_i,
+                    kappa_i,
+                    mu_j,
+                    count_j,
+                    kappa_j,
+                    self.dim,
                 )
-                max_margin = max(max_margin, delta_m)
-            margin_rad = min(max_margin, math.pi)
+            margin_rad = min(delta_m, math.pi)
             margins[i] = margin_rad
 
         self.margins = margins
@@ -114,52 +127,52 @@ class MARGINLossHead(nn.Module):
 
         return margins, scales
 
-    def forward(self, cos_theta, labels):
-        B, C = cos_theta.shape
-
-        # 每个样本对应的 margin
-        margins = self.margins[labels]  # [B]
-
-        cos_theta = torch.clamp(cos_theta, -1 + 1e-7, 1 - 1e-7)
-
-        # one-hot
-        one_hot = F.one_hot(labels, C).float()
-
-        # CosFace: cos(theta) - m
-        cos_theta_minus_m = cos_theta - margins.unsqueeze(1)
-
-        # 只对 target class 减 margin
-        output = cos_theta * (1 - one_hot) + cos_theta_minus_m * one_hot
-
-        # scale
-        output = output * self.scales.unsqueeze(0)
-
-        loss = F.cross_entropy(output, labels)
-        return loss
-
-    # def forward(self, cos_theta, labels):
+    # def forward(self, cos_theta, label_idxs):
     #     B, C = cos_theta.shape
 
-    #     # ✅ margins 按标签取（每个样本一个 margin）
-    #     margins_batch = self.margins[labels]  # [B]
+    #     # 每个样本对应的 margin
+    #     margins = self.margins[label_idxs]  # [B]
 
     #     cos_theta = torch.clamp(cos_theta, -1 + 1e-7, 1 - 1e-7)
 
-    #     cos_m = torch.cos(margins_batch)
-    #     sin_m = torch.sin(margins_batch)
+    #     # one-hot
+    #     one_hot = F.one_hot(label_idxs, C).float()
 
-    #     sin_theta = torch.sqrt(torch.clamp(1 - cos_theta**2, min=1e-7))
+    #     # CosFace: cos(theta) - m
+    #     cos_theta_minus_m = cos_theta - margins.unsqueeze(1)
 
-    #     cos_theta_plus_m = cos_theta * cos_m.unsqueeze(1) - sin_theta * sin_m.unsqueeze(
-    #         1
-    #     )
+    #     # 只对 target class 减 margin
+    #     output = cos_theta * (1 - one_hot) + cos_theta_minus_m * one_hot
 
-    #     one_hot = F.one_hot(labels, C).float()
-
-    #     output = cos_theta * (1 - one_hot) + cos_theta_plus_m * one_hot
-
-    #     # self.scales: [C] → unsqueeze(0): [1, C] → 广播到 [B, C]
+    #     # scale
     #     output = output * self.scales.unsqueeze(0)
 
-    #     loss = F.cross_entropy(output, labels)
+    #     loss = F.cross_entropy(output, label_idxs)
     #     return loss
+
+    def forward(self, cos_theta, label_idxs):
+        B, C = cos_theta.shape
+
+        # ✅ margins 按标签取（每个样本一个 margin）
+        margins_batch = self.margins[label_idxs]  # [B]
+
+        cos_theta = torch.clamp(cos_theta, -1 + 1e-7, 1 - 1e-7)
+
+        cos_m = torch.cos(margins_batch)
+        sin_m = torch.sin(margins_batch)
+
+        sin_theta = torch.sqrt(torch.clamp(1 - cos_theta**2, min=1e-7))
+
+        cos_theta_plus_m = cos_theta * cos_m.unsqueeze(1) - sin_theta * sin_m.unsqueeze(
+            1
+        )
+
+        one_hot = F.one_hot(label_idxs, C).float()
+
+        output = cos_theta * (1 - one_hot) + cos_theta_plus_m * one_hot
+
+        # self.scales: [C] → unsqueeze(0): [1, C] → 广播到 [B, C]
+        output = output * self.scales.unsqueeze(0)
+
+        loss = F.cross_entropy(output, label_idxs)
+        return loss
