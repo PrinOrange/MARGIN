@@ -39,7 +39,7 @@ def evaluate_model(model: MARGINModel, dataloader: DataLoader, title: str, devic
             # 计算loss（用于早停）
             with torch.autocast(device):
                 cos_theta = model(input_ids, attention_mask)
-                loss = model.classification_loss(cos_theta, label_idxs)
+                loss = model.loss_head(cos_theta, label_idxs)
 
             total_loss += loss.item()
             num_batches += 1
@@ -61,10 +61,11 @@ def evaluate_model(model: MARGINModel, dataloader: DataLoader, title: str, devic
         all_truth_label_idx, all_pred_label_idx, all_features
     )
     etf_metrics = compute_etf_metrics(model.current_geometric_median_prototypes.cpu())
+
     statistics_metrics = compute_statistics_metrics(
-        model.classification_loss.kappas,
-        model.classification_loss.margins,
-        model.classification_loss.scales,
+        model.loss_head.kappas,
+        model.loss_head.margins,
+        model.loss_head.scales,
         model.id2label,
     )
 

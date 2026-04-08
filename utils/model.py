@@ -41,7 +41,7 @@ class MARGINModel(nn.Module):
         self.label2id = train_dataset.label2idx
         self.id2label = train_dataset.idx2label
 
-        self.classification_loss: MARGINLossHead = MARGINLossHead(
+        self.loss_head: MARGINLossHead = MARGINLossHead(
             self.num_classes, base_scale, alpha, self.embedding_dim
         )
 
@@ -88,6 +88,7 @@ class MARGINLossHead(nn.Module):
             margins: [C]
             scales: [C]
         """
+        print("Updated", kappas)
         device = kappas.device
         C = self.num_classes
         # --- 防止数值问题 ---
@@ -118,6 +119,10 @@ class MARGINLossHead(nn.Module):
         self.margins = margins
         self.kappas = kappas
         self.scales = scales
+
+        print(f"Updated margins: {margins}")
+        print(f"Updated scales: {scales}")
+        print(f"Updated kappas: {kappas}")
 
         return margins, scales
 

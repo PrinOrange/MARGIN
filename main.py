@@ -78,19 +78,12 @@ class Trainer:
     def __init__(self, model: MARGINModel):
         self.model = model.to(DEVICE)
 
-        self.classification_loss: MARGINLossHead = MARGINLossHead(
-            self.model.num_classes,
-            BASE_SCALE,
-            CONFIDENCE_ALPHA,
-            self.model.embedding_dim,
-        ).to(DEVICE)
-
         self.optimizer = torch.optim.AdamW(
             self.model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY
         )
         self.scaler = GradScaler()
 
-        self.best_global_mcc = float("inf")
+        self.best_global_mcc = float("-inf")
         self.patience_counter = 0
         self.best_model_state = None
 
@@ -114,7 +107,7 @@ class Trainer:
                 cos_theta, features = self.model(
                     input_ids, attention_mask, return_features=True
                 )
-                loss = self.classification_loss(cos_theta, label_idxs)
+                loss = self.model.loss_head(cos_theta, label_idxs)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -141,14 +134,6 @@ class Trainer:
         # 预分配张量列表，避免动态扩容
         for label_idx in range(C):
             feats = feature_accumulator[label_idx]
-
-            # 处理空类别
-            if len(feats) == 0:
-                mean_prototypes_list.append(torch.zeros(D))
-                geom_median_prototypes_list.append(torch.zeros(D))
-                kappas_list.append(torch.tensor(0.0))
-                class_counts_list.append(0)
-                continue
 
             # 1. 一次性堆叠，效率更高
             feats_tensor = torch.stack(feats, dim=0)  # [N, D]
@@ -186,8 +171,8 @@ class Trainer:
         self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
         self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
 
-        # 更新损失函数的自适应参数
-        self.classification_loss.update_adaptive_params(
+        # 我明明在这里面更新了 params 自适应参数
+        self.model.loss_head.update_adaptive_params(
             self.model.current_kappas,
             self.model.class_counts,
             self.model.current_mean_prototypes,
@@ -334,7 +319,7 @@ class Trainer:
             log.print(f"Val Loss: {avg_val_loss:.4f}")
 
             # 早停逻辑不变
-            if val_global_mcc > self.best_global_mcc:
+            if val_global_mcc < self.best_global_mcc:
                 self.best_global_mcc = val_global_mcc
                 self.patience_counter = 0
                 self.best_model_state = {
@@ -352,6 +337,14 @@ class Trainer:
                 if self.patience_counter >= EARLY_STOPPING_PATIENCE:
                     log.print(f"\nEarly stopping triggered at epoch {epoch}")
                     break
+            if self.best_model_state is not None:
+                best_epoch = self.best_model_state["epoch"]
+                best_mcc = self.best_model_state["val_mcc"]
+                log.print(f"🏆 Current Best: Epoch {best_epoch} | MCC {best_mcc:.4f}")
+            else:
+                log.print(
+                    f"🏆 Current Best: Epoch {epoch} | MCC {val_global_mcc:.4f}"
+                )  # 第一轮的情况
 
         if self.best_model_state is not None:
             log.print(
