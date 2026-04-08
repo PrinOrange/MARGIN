@@ -6,6 +6,41 @@ import umap
 
 
 def draw_prototype_dispersion(
+    geometric_median_prototypes: torch.Tensor,
+    id2label: dict,
+    title: str,
+    filepath: str,
+):
+    geo = geometric_median_prototypes.cpu().numpy()
+
+    # cosine similarity matrix
+    sim_matrix = geo @ geo.T
+    sim_matrix = sim_matrix * 100
+
+    plt.figure(figsize=(10, 8))
+
+    plt.imshow(
+        sim_matrix,
+        cmap="viridis",
+        vmin=-100,
+        vmax=100,
+        interpolation="nearest",
+        aspect="auto",
+    )
+
+    cbar = plt.colorbar()
+    cbar.set_label("Cosine Similarity (%)")
+
+    plt.xlabel("Class (sorted by sample count: high → low)")
+    plt.ylabel("Class (sorted by sample count: high → low)")
+
+    plt.title(title)
+
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=300)
+    plt.close()
+
+def draw_prototype_dispersion_grid(
     geometric_median_prototypes: torch.Tensor, id2label: dict, title: str, filepath: str
 ):
     geo_medians = geometric_median_prototypes.cpu().numpy()
@@ -29,8 +64,7 @@ def draw_prototype_dispersion(
     plt.savefig(filepath)
     plt.close()
 
-
-def draw_prototype_alignment(
+def draw_prototype_alignment_grid(
     geometric_median_prototypes: torch.Tensor,
     weight_prototypes: torch.Tensor,
     id2label: dict,
@@ -56,6 +90,42 @@ def draw_prototype_alignment(
     plt.savefig(filepath)
     plt.close()
 
+def draw_prototype_alignment(
+    geometric_median_prototypes: torch.Tensor,
+    weight_prototypes: torch.Tensor,
+    id2label: dict,
+    title: str,
+    filepath: str,
+):
+    geo = geometric_median_prototypes.detach()
+    weight = weight_prototypes.detach()
+
+    # cosine similarity
+    sim_matrix = torch.matmul(geo, weight.t())
+    sim_matrix = (sim_matrix * 100).cpu().numpy()
+
+    plt.figure(figsize=(10, 8))
+
+    plt.imshow(
+        sim_matrix,
+        cmap="coolwarm",
+        vmin=-100,
+        vmax=100,
+        interpolation="nearest",
+        aspect="auto",
+    )
+
+    cbar = plt.colorbar(fraction=0.046, pad=0.04)
+    cbar.set_label("Cosine Similarity (%)")
+
+    plt.xlabel("Classifier Prototypes (sorted by sample count: high → low)")
+    plt.ylabel("Geometric Median Prototypes (sorted by sample count: high → low)")
+
+    plt.title(title)
+
+    plt.tight_layout()
+    plt.savefig(filepath, dpi=300)
+    plt.close()
 
 def draw_umap(
     features: torch.Tensor,
