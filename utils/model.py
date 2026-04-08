@@ -88,7 +88,6 @@ class MARGINLossHead(nn.Module):
             margins: [C]
             scales: [C]
         """
-        print("Updated", kappas)
         device = kappas.device
         C = self.num_classes
         # --- 防止数值问题 ---

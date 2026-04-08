@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "debug"  # 可选其他subset
+DATASET_SUBSET = "megavul"  # 可选其他subset
 MAX_LENGTH = 512
 
 # 模型配置
@@ -319,14 +319,14 @@ class Trainer:
             log.print(f"Val Loss: {avg_val_loss:.4f}")
 
             # 早停逻辑不变
-            if val_global_mcc < self.best_global_mcc:
+            if val_global_mcc > self.best_global_mcc:
                 self.best_global_mcc = val_global_mcc
                 self.patience_counter = 0
                 self.best_model_state = {
                     "epoch": epoch,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_loss": avg_val_loss,
+                    "val_global_mcc": val_global_mcc,
                 }
                 log.print("Model improved, saved checkpoint.")
             else:
@@ -339,7 +339,7 @@ class Trainer:
                     break
             if self.best_model_state is not None:
                 best_epoch = self.best_model_state["epoch"]
-                best_mcc = self.best_model_state["val_mcc"]
+                best_mcc = self.best_model_state["val_global_mcc"]
                 log.print(f"🏆 Current Best: Epoch {best_epoch} | MCC {best_mcc:.4f}")
             else:
                 log.print(
