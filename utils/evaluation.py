@@ -1,7 +1,12 @@
 import torch
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from utils.metrics import compute_metrics
+from utils.metrics import (
+    compute_classification_metrics,
+    compute_clustering_metrics,
+    compute_etf_metrics,
+    compute_statistics_metrics,
+)
 from utils.model import MARGINModel
 
 
@@ -46,11 +51,31 @@ def evaluate_model(model: MARGINModel, dataloader: DataLoader, title: str, devic
             all_raw_labels.extend(batch["raw_label"])
 
     avg_loss = total_loss / num_batches
-    all_features = torch.cat(all_features, dim=0).numpy()
+    all_features = torch.cat(all_features, dim=0)
 
     # 计算指标
-    metrics = compute_metrics(all_truth_label_idx, all_pred_label_idx, model.id2label)
-    metrics["val_loss"] = avg_loss
+    classification_metrics = compute_classification_metrics(
+        all_truth_label_idx, all_pred_label_idx, model.id2label
+    )
+    clustering_metrics = compute_clustering_metrics(
+        all_truth_label_idx, all_pred_label_idx, all_features
+    )
+    etf_metrics = compute_etf_metrics(model.current_geometric_median_prototypes.cpu())
+    statistics_metrics = compute_statistics_metrics(
+        model.classification_loss.kappas,
+        model.classification_loss.margins,
+        model.classification_loss.scales,
+        model.id2label,
+    )
+
+    metrics = {
+        "val_loss": avg_loss,
+        "classification_metrics": classification_metrics,
+        "clustering_metrics": clustering_metrics,
+        "etf_metrics": etf_metrics,
+        "statistics_metrics": statistics_metrics,
+    }
+
     return (
         metrics,
         all_features,

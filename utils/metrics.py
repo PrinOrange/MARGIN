@@ -1,4 +1,7 @@
 import numpy as np
+import math
+import torch
+import torch.nn.functional as F
 from sklearn.metrics import (
     accuracy_score,
     confusion_matrix,
@@ -7,10 +10,19 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
 )
+from sklearn.metrics import (
+    normalized_mutual_info_score,
+    adjusted_rand_score,
+    adjusted_mutual_info_score,
+    v_measure_score,
+    fowlkes_mallows_score,
+    silhouette_score,
+)
+from sklearn.preprocessing import normalize
 
 
 # ==================== 评估指标计算 ====================
-def compute_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
+def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
     """
     计算各类评估指标
     假设：idx2label 中索引 0 为 'Non-vul' (负例)，其余为正例
@@ -260,3 +272,91 @@ def compute_metrics(truth_label_idx, pred_label_idx, idx2label: dict):
     }
 
     return metrics
+
+
+def compute_clustering_metrics(truth_label_idx, pred_label_idx, features=None):
+    truth_label_idx = np.array(truth_label_idx)
+    pred_label_idx = np.array(pred_label_idx)
+
+    clustering_metrics = {}
+
+    clustering_metrics["nmi"] = normalized_mutual_info_score(
+        truth_label_idx, pred_label_idx
+    )
+    clustering_metrics["ari"] = adjusted_rand_score(truth_label_idx, pred_label_idx)
+    clustering_metrics["ami"] = adjusted_mutual_info_score(
+        truth_label_idx, pred_label_idx
+    )
+    clustering_metrics["fmi"] = fowlkes_mallows_score(truth_label_idx, pred_label_idx)
+    clustering_metrics["v_measure"] = v_measure_score(truth_label_idx, pred_label_idx)
+    features_normalized = normalize(features, norm="l2", axis=1)
+    angular_sh = silhouette_score(features_normalized, pred_label_idx, metric="cosine")
+    clustering_metrics["angular_silhouette_score"] = angular_sh
+    return clustering_metrics
+
+
+def compute_etf_metrics(prototypes: torch.Tensor):
+    P = F.normalize(prototypes, dim=1)  # 确保归一化
+    K, d = P.shape
+
+    # Gram matrix
+    G = P @ P.T
+
+    # 1. ETF 理想 Gram
+    target = torch.full((K, K), -1 / (K - 1), device=P.device)
+    target.fill_diagonal_(1)
+    etf_error = torch.norm(G - target, p="fro").item()
+
+    # 2. Cosine variance
+    mask = ~torch.eye(K, dtype=bool, device=P.device)
+    cosines = G[mask]
+    cosine_variance = cosines.var().item()
+
+    # 3. Welch bound gap
+    max_cos = cosines.abs().max().item()
+    welch_bound = math.sqrt((K - d) / (d * (K - 1)))
+    welch_gap = max_cos - welch_bound
+
+    # 4. Average cosine deviation
+    avg_cosine_deviation = torch.mean(torch.abs(cosines - (-1 / (K - 1)))).item()
+
+    # 5. Gram eigenvalue deviation
+    eigvals = torch.linalg.eigvalsh(G)
+    non_zero_eig = eigvals[eigvals > 1e-6]
+    eig_var = non_zero_eig.var().item()
+
+    return {
+        "etf_error": etf_error,
+        "cosine_variance": cosine_variance,
+        "welch_gap": welch_gap,
+        "avg_cosine_deviation": avg_cosine_deviation,
+        "eig_var": eig_var,
+    }
+
+
+def compute_statistics_metrics(kappas, margins, scales, id2label):
+
+    kappas = kappas.detach().cpu()
+    margins = margins.detach().cpu()
+    scales = scales.detach().cpu()
+    C = kappas.shape[0]
+
+    per_class = {}
+    for i in range(C):
+        label = id2label[i]
+        per_class[label] = {
+            "kappa": float(kappas[i]),
+            "margin": float(margins[i]),
+            "scale": float(scales[i]),
+        }
+
+    summary = {
+        "kappa_mean": float(kappas.mean()),
+        "kappa_std": float(kappas.std()),
+        "margin_mean": float(margins.mean()),
+        "margin_std": float(margins.std()),
+        "scale_mean": float(scales.mean()),
+        "scale_std": float(scales.std()),
+    }
+
+    return {"per_class": per_class, "summary": summary}

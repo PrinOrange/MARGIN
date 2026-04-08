@@ -15,12 +15,14 @@ from utils.math import (
     compute_geometric_median,
     compute_vmf_kappa,
 )
+from utils.string import print_dict_pipe
 from utils.visualize import (
     draw_prototype_dispersion,
     draw_prototype_alignment,
     draw_umap,
 )
 from utils.evaluation import evaluate_model
+from utils.logger import log
 
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -52,7 +54,7 @@ SEED = 42
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 # 输出配置
-OUTPUT_DIR = f"./output/{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"
+OUTPUT_DIR = f"./output/{DATASET_SUBSET}-{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"
 UMAP_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "umap")
 PROTOTYPE_ALIGNMENT_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prototype-alignment")
 PROTOTYPE_DISPERSION_OUTPUT_DIR = os.path.join(OUTPUT_DIR, "prototype-dispersion")
@@ -68,7 +70,7 @@ UMAP_N_NEIGHBORS = 15
 UMAP_MIN_DIST = 0.1
 
 set_seed(SEED)
-
+log.set_log_file(os.path.join(OUTPUT_DIR, "train.log"))
 
 # ==================== 训练器 ====================
 class Trainer:
@@ -87,7 +89,7 @@ class Trainer:
         )
         self.scaler = GradScaler()
 
-        self.best_val_loss = float("inf")
+        self.best_global_mcc = float("inf")
         self.patience_counter = 0
         self.best_model_state = None
 
@@ -207,6 +209,11 @@ class Trainer:
             self.model.eval(), dataloader, f"Epoch {epoch} Evaluating", DEVICE
         )
 
+        classification_metrics = metrics["classification_metrics"]
+        clustering_metrics = metrics["clustering_metrics"]
+        etf_metrics = metrics["etf_metrics"]
+        statistics_metrics = metrics["statistics_metrics"]
+
         # 保存到JSON
         json_path = os.path.join(
             REPORT_OUTPUT_DIR, f"{save_prefix}_metrics_epoch_{epoch}.json"
@@ -215,24 +222,31 @@ class Trainer:
             json.dump(metrics, f, indent=2)
 
         # 打印指标
-        print(f"\nEpoch {epoch} Evaluation Results:")
-        print(
-            f"🐱 Binary - MCC: {metrics['binary']['mcc']:.4f}, F1: {metrics['binary']['f1']:.4f}, "
-            f"Prec: {metrics['binary']['precision']:.4f}, Rec: {metrics['binary']['recall']:.4f}"
+        log.print(f"\nEpoch {epoch} Evaluation Results: ==========================================")
+        log.print("Classification Metrics: ---------------------------------")
+        log.print(
+            f"🐱 Binary - MCC: {classification_metrics['binary']['mcc']:.4f}, F1: {classification_metrics['binary']['f1']:.4f}, "
+            f"Prec: {classification_metrics['binary']['precision']:.4f}, Rec: {classification_metrics['binary']['recall']:.4f}"
+        )
+        log.print(
+            f"🐒 Positive-Macro - MCC: {classification_metrics['positive_macro']['mcc']:.4f}, "
+            f"F1: {classification_metrics['positive_macro']['f1']:.4f}"
+        )
+        log.print(
+            f"🌏 Global-Macro - MCC: {classification_metrics['global_macro']['mcc']:.4f}, "
+            f"F1: {classification_metrics['global_macro']['f1']:.4f}, "
+            f"FNR: {classification_metrics['global_macro']['fnr']:.4f}, "
+            f"FPR: {classification_metrics['global_macro']['fpr']:.4f}"
         )
 
-        if "positive_macro" in metrics:
-            print(
-                f"🐒 Positive-Macro - MCC: {metrics['positive_macro']['mcc']:.4f}, "
-                f"F1: {metrics['positive_macro']['f1']:.4f}"
-            )
+        log.print("Clustering Metrics: ---------------------------------")
+        log.print(print_dict_pipe(clustering_metrics))
 
-        print(
-            f"🌏 Global-Macro - MCC: {metrics['global_macro']['mcc']:.4f}, "
-            f"F1: {metrics['global_macro']['f1']:.4f}, "
-            f"FNR: {metrics['global_macro']['fnr']:.4f}, "
-            f"FPR: {metrics['global_macro']['fpr']:.4f}"
-        )
+        log.print("ETF Metrics: ---------------------------------")
+        log.print(print_dict_pipe(etf_metrics))
+
+        log.print("Statistics Metrics: ---------------------------------")
+        log.print(print_dict_pipe(statistics_metrics))
 
         # 绘制可视化
         self.visualize_epoch(all_features, all_truth_label_idx, epoch)
@@ -276,9 +290,9 @@ class Trainer:
 
     def train(self):
         for epoch in range(1, MAX_EPOCHS + 1):
-            print(f"\n{'='*50}")
-            print(f"Epoch {epoch}/{MAX_EPOCHS}")
-            print(f"{'='*50}")
+            log.print(f"\n{'='*50}")
+            log.print(f"Epoch {epoch}/{MAX_EPOCHS}")
+            log.print(f"{'='*50}")
             g = torch.Generator()
             g.manual_seed(SEED)
             train_loader = DataLoader(
@@ -297,52 +311,39 @@ class Trainer:
                 pin_memory=True,
             )
 
-            # 打印当前 margin 和 kappa（来自上一轮 finalize 的结果，首轮是初始值）
-            print("\nClass-wise Kappa and Margin:")
-            for i in range(self.model.num_classes):
-                margin = self.classification_loss.margins[i]
-                scale = self.classification_loss.scales[i]
-                print(
-                    f"  {self.model.id2label[i]}: κ={self.model.current_kappas[i]:.2f}, m={margin:.4f}, s={scale:.2f}"
-                )
-
             # 训练（内部已更新 stats）
             train_loss = self.train_epoch(train_loader, epoch)
-            print(f"\nTrain Loss: {train_loss:.4f}")
+            log.print(f"\nTrain Loss: {train_loss:.4f}")
 
             # 注意：geometric_medians 已在 train_epoch 结尾更新，可直接用于 evaluate
-            val_loss, metrics = self.evaluate_epoch(val_loader, epoch)
-            print(f"Val Loss: {val_loss:.4f}")
+            avg_val_loss, val_classification_metrics = self.evaluate_epoch(
+                val_loader, epoch
+            )
+            val_global_mcc = val_classification_metrics["global_macro"]["mcc"]
+            log.print(f"Val Loss: {avg_val_loss:.4f}")
 
             # 早停逻辑不变
-            if val_loss < self.best_val_loss:
-                self.best_val_loss = val_loss
+            if val_global_mcc > self.best_global_mcc:
+                self.best_global_mcc = val_global_mcc
                 self.patience_counter = 0
                 self.best_model_state = {
                     "epoch": epoch,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_loss": val_loss,
-                    "kappas": self.model.current_kappas.clone(),
-                    "margins": (
-                        {
-                            i: self.classification_loss.margins[i]
-                            for i in range(self.model.num_classes)
-                        }
-                    ),
+                    "val_loss": avg_val_loss,
                 }
-                print("Model improved, saved checkpoint.")
+                log.print("Model improved, saved checkpoint.")
             else:
                 self.patience_counter += 1
-                print(
+                log.print(
                     f"No improvement. Patience: {self.patience_counter}/{EARLY_STOPPING_PATIENCE}"
                 )
                 if self.patience_counter >= EARLY_STOPPING_PATIENCE:
-                    print(f"\nEarly stopping triggered at epoch {epoch}")
+                    log.print(f"\nEarly stopping triggered at epoch {epoch}")
                     break
 
         if self.best_model_state is not None:
-            print(f"\nLoading best model from epoch {self.best_model_state['epoch']}")
+            log.print(f"\nLoading best model from epoch {self.best_model_state['epoch']}")
             self.model.load_state_dict(self.best_model_state["model_state_dict"])
 
         return self.model
@@ -350,7 +351,7 @@ class Trainer:
 
 # ==================== 主函数 ====================
 def main():
-    print("Loading dataset...")
+    log.print("Loading dataset...")
     # 加载HuggingFace数据集
     dataset = load_dataset(DATASET_NAME, DATASET_SUBSET)
 
@@ -358,12 +359,12 @@ def main():
     val_hf = dataset["val"]
     test_hf = dataset["test"]
 
-    print(
+    log.print(
         f"Train size: {len(train_hf)}, Val size: {len(val_hf)}, Test size: {len(test_hf)}"
     )
 
     # 初始化tokenizer
-    print(f"Loading tokenizer and model: {MODEL_NAME}")
+    log.print(f"Loading tokenizer and model: {MODEL_NAME}")
 
     # 创建数据集
     train_dataset = CodeDataset(MODEL_NAME, train_hf, MAX_LENGTH)
@@ -372,8 +373,8 @@ def main():
     # 构建标签映射（确保所有数据集使用相同映射）
     label2id = train_dataset.label2idx
 
-    print(f"Number of classes: {len(label2id)}")
-    print(f"Label mapping: {label2id}")
+    log.print(f"Number of classes: {len(label2id)}")
+    log.print(f"Label mapping: {label2id}")
 
     # 初始化模型
     model = MARGINModel(
