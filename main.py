@@ -10,7 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 from utils.seed import set_seed
 from utils.dataset import CodeDataset
-from utils.model import MARGINLossHead, MARGINModel
+from utils.model import MARGINModel
 from utils.math import (
     compute_geometric_median,
     compute_vmf_kappa,
@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "debug"  # 可选其他subset
+DATASET_SUBSET = "reposvul"  # 可选其他subset
 MAX_LENGTH = 512
 
 # 模型配置
@@ -51,7 +51,7 @@ MIN_KAPPA = 1.0  # 防止kappa过小导致数值不稳定
 SEED = 42
 
 # 设备配置
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda:2"
 TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 # 输出配置
 OUTPUT_DIR = f"./output/{DATASET_SUBSET}-{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"
