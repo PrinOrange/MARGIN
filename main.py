@@ -29,7 +29,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "reposvul"  # 可选其他subset
+DATASET_SUBSET = "debug"  # 可选其他subset
 MAX_LENGTH = 512
 
 # 模型配置
@@ -37,7 +37,7 @@ MODEL_NAME = "Salesforce/codet5-base"
 EMBEDDING_DIM = 768  # graphcodebert-base的维度
 
 # 训练配置
-BATCH_SIZE = 32
+BATCH_SIZE = 40
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 MAX_EPOCHS = 200
@@ -45,13 +45,13 @@ EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 SCHEDULER_PATIENCE = 3
 
 # ArcFace & 球面配置
-BASE_SCALE = 20  # s
+BASE_SCALE = 15  # s
 CONFIDENCE_ALPHA = 0.95  # α
 MIN_KAPPA = 1.0  # 防止kappa过小导致数值不稳定
 SEED = 42
 
 # 设备配置
-DEVICE = "cuda:2"
+DEVICE = "cuda:0"
 TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 # 输出配置
 OUTPUT_DIR = f"./output/{DATASET_SUBSET}-{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"
@@ -374,7 +374,8 @@ def main():
 
     # 创建数据集
     train_dataset = CodeDataset(MODEL_NAME, train_hf, MAX_LENGTH)
-    val_dataset = CodeDataset(MODEL_NAME, val_hf, MAX_LENGTH)
+    # val_dataset = CodeDataset(MODEL_NAME, val_hf, MAX_LENGTH)
+    test_dataset = CodeDataset(MODEL_NAME, test_hf, MAX_LENGTH)
 
     # 构建标签映射（确保所有数据集使用相同映射）
     label2id = train_dataset.label2idx
@@ -388,7 +389,7 @@ def main():
         base_scale=BASE_SCALE,
         alpha=CONFIDENCE_ALPHA,
         train_dataset=train_dataset,
-        val_dataset=val_dataset,
+        val_dataset=test_dataset,
     )
 
     # 训练

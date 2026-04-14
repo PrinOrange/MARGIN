@@ -1,12 +1,11 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForTextEncoding
 from utils.dataset import CodeDataset
 from utils.math import compute_pairwise_margin, compute_margin
-
+from utils.logger import log
 
 # ==================== 模型定义 ====================
 class MARGINModel(nn.Module):
@@ -119,9 +118,9 @@ class MARGINLossHead(nn.Module):
         self.kappas = kappas
         self.scales = scales
 
-        print(f"Updated margins: {margins}")
-        print(f"Updated scales: {scales}")
-        print(f"Updated kappas: {kappas}")
+        log.print(f"Updated margins: {margins}")
+        log.print(f"Updated scales: {scales}")
+        log.print(f"Updated kappas: {kappas}")
 
         return margins, scales
 

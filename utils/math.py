@@ -45,12 +45,12 @@ def compute_margin(
 
     kappa_i_eff = kappa_i * count_i / (count_i + 1)
 
-    theta_i = math.sqrt(q / kappa_i_eff)
+    theta_vmf = math.sqrt(q / kappa_i_eff)
 
     # ETF Voronoi cone angle
-    theta_voronoi = 0.5 * math.acos(-1 / (n - 1))
+    theta_voronoi_cell = 0.5 * math.acos(-1 / (n - 1))
 
-    margin = max(1e-6, 0.5*(theta_i - theta_voronoi))
+    margin = max(1e-6, (theta_vmf - theta_voronoi_cell))
 
     return margin
 
