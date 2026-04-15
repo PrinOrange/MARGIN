@@ -40,6 +40,7 @@ def draw_prototype_dispersion_no_num(
     plt.savefig(filepath, dpi=300)
     plt.close()
 
+
 def draw_prototype_dispersion(
     geometric_median_prototypes: torch.Tensor, id2label: dict, title: str, filepath: str
 ):
@@ -63,6 +64,7 @@ def draw_prototype_dispersion(
     plt.tight_layout()
     plt.savefig(filepath)
     plt.close()
+
 
 def draw_prototype_alignment(
     geometric_median_prototypes: torch.Tensor,
@@ -89,6 +91,7 @@ def draw_prototype_alignment(
     plt.tight_layout()
     plt.savefig(filepath)
     plt.close()
+
 
 def draw_prototype_alignment_no_num(
     geometric_median_prototypes: torch.Tensor,
@@ -126,6 +129,7 @@ def draw_prototype_alignment_no_num(
     plt.tight_layout()
     plt.savefig(filepath, dpi=300)
     plt.close()
+
 
 def draw_umap(
     features: torch.Tensor,

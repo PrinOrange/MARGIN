@@ -29,15 +29,15 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "megavul"  # 可选其他 subset
+DATASET_SUBSET = "debug"  # 可选其他 subset
 MAX_LENGTH = 512
 
 # 模型配置
-MODEL_NAME = "Salesforce/codet5-base"
+MODEL_NAME = "microsoft/unixcoder-base"
 EMBEDDING_DIM = 768  # graphcodebert-base 的维度
 
 # 训练配置
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 MAX_EPOCHS = 200
@@ -45,7 +45,7 @@ EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 SCHEDULER_PATIENCE = 3
 
 # ArcFace & 球面配置
-BASE_SCALE = 15  # s
+BASE_SCALE = 20  # s
 CONFIDENCE_ALPHA = 0.95  # α
 SEED = 42
 

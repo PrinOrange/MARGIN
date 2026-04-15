@@ -7,6 +7,7 @@ from utils.dataset import CodeDataset
 from utils.math import compute_pairwise_margin, compute_margin
 from utils.logger import log
 
+
 # ==================== 模型定义 ====================
 class MARGINModel(nn.Module):
     def __init__(
@@ -135,9 +136,7 @@ class MARGINLossHead(nn.Module):
         sin_m = torch.sin(margins_batch)
         # 只取 GT 类 logits
         target_cos = cos_theta[torch.arange(B, device=device), label_idxs]
-        target_sin = torch.sqrt(
-            torch.clamp(1.0 - target_cos**2, min=1e-7)
-        )
+        target_sin = torch.sqrt(torch.clamp(1.0 - target_cos**2, min=1e-7))
         # ArcFace:
         target_cos_margin = target_cos * cos_m - target_sin * sin_m
         # 替换 GT logits
@@ -198,4 +197,3 @@ class MARGINLossHead(nn.Module):
 
     #     loss = F.cross_entropy(output, label_idxs)
     #     return loss
-

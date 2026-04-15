@@ -3,6 +3,7 @@ from collections import Counter
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
+
 class CodeDataset(Dataset):
     def __init__(self, backbone: str, hf_dataset: str, max_length: int):
         self.dataset = hf_dataset
@@ -24,7 +25,7 @@ class CodeDataset(Dataset):
         if "Non-vul" in sorted_labels:
             sorted_labels.remove("Non-vul")
             sorted_labels.insert(0, "Non-vul")
-    
+
         for idx, label in enumerate(sorted_labels):
             self.label2idx[label] = idx
             self.idx2label[idx] = label

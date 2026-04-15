@@ -122,28 +122,29 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
 
     metrics["global_macro"]["fnr"] = float(np.mean(fnr_list))
     metrics["global_macro"]["fpr"] = float(np.mean(fpr_list))
-    
+
     # =========================================================================
     # 3. Positive Macro (仅在真实正样本子集上评估 CWE 分类能力)
     # =========================================================================
     positive_label_idx = [l for l in all_label_idx if l != 0]
     metrics["positive_macro"] = {"per_class": {}}
-    
+
     if len(positive_label_idx) > 0:
-    
-        # Step1: 仅保留真实为 positive 的样本
+
+        # Step1: 仅保留真实 positive 样本
         pos_indices = [
-            i for i, y in enumerate(truth_label_idx)
-            if y in positive_label_idx
+            i for i, y in enumerate(truth_label_idx) if y in positive_label_idx
         ]
-    
+
         if len(pos_indices) > 0:
-        
+
             y_true_pos = np.array([truth_label_idx[i] for i in pos_indices])
+
             y_pred_pos = np.array([pred_label_idx[i] for i in pos_indices])
-    
+
             # ---------------------------------------------------------
-            # 3.1 Macro F1 / Precision / Recall
+            # 3.1 Macro Precision / Recall / F1
+            # sklearn 会自动把预测到 non-vul(0) 当成 miss/FN
             # ---------------------------------------------------------
             metrics["positive_macro"]["f1"] = f1_score(
                 y_true_pos,
@@ -152,7 +153,7 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
                 labels=positive_label_idx,
                 zero_division=0,
             )
-    
+
             metrics["positive_macro"]["precision"] = precision_score(
                 y_true_pos,
                 y_pred_pos,
@@ -160,7 +161,7 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
                 labels=positive_label_idx,
                 zero_division=0,
             )
-    
+
             metrics["positive_macro"]["recall"] = recall_score(
                 y_true_pos,
                 y_pred_pos,
@@ -168,76 +169,73 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
                 labels=positive_label_idx,
                 zero_division=0,
             )
-    
+
             # ---------------------------------------------------------
-            # 3.2 Macro MCC
+            # 3.2 Macro MCC + Per-class OVA Metrics
+            # 严格 One-vs-Rest
             # ---------------------------------------------------------
             pos_mcc_scores = []
-    
+
             for label_idx in positive_label_idx:
-            
+
                 y_true_binary = (y_true_pos == label_idx).astype(int)
+
                 y_pred_binary = (y_pred_pos == label_idx).astype(int)
-    
-                if np.sum(y_true_binary) > 0:
-                    try:
-                        mcc = matthews_corrcoef(
-                            y_true_binary,
-                            y_pred_binary,
-                        )
-                        pos_mcc_scores.append(mcc)
-                    except ValueError:
-                        pos_mcc_scores.append(0.0)
-    
-            metrics["positive_macro"]["mcc"] = (
-                float(np.mean(pos_mcc_scores))
-                if pos_mcc_scores else 0.0
-            )
-    
-            # ---------------------------------------------------------
-            # 3.3 Per-class Metrics
-            # ---------------------------------------------------------
-            cm_pos = confusion_matrix(
-                y_true_pos,
-                y_pred_pos,
-                labels=positive_label_idx
-            )
-    
-            for local_idx, label_idx in enumerate(positive_label_idx):
-            
-                tp = cm_pos[local_idx, local_idx]
-                fn = np.sum(cm_pos[local_idx, :]) - tp
-                fp = np.sum(cm_pos[:, local_idx]) - tp
-                tn = np.sum(cm_pos) - tp - fn - fp
-    
+
+                # -------------------------
+                # TP / FP / TN / FN
+                # -------------------------
+                tp = int(np.sum((y_true_binary == 1) & (y_pred_binary == 1)))
+
+                fp = int(np.sum((y_true_binary == 0) & (y_pred_binary == 1)))
+
+                fn = int(np.sum((y_true_binary == 1) & (y_pred_binary == 0)))
+
+                tn = int(np.sum((y_true_binary == 0) & (y_pred_binary == 0)))
+
                 support = tp + fn
-    
-                y_true_binary = (y_true_pos == label_idx).astype(int)
-                y_pred_binary = (y_pred_pos == label_idx).astype(int)
-    
-                binary_metrics = compute_binary_metrics(
-                    y_true_binary,
-                    y_pred_binary
-                )
-    
-                metrics["positive_macro"]["per_class"][
-                    idx2label[label_idx]
-                ] = {
-                    "tp": int(tp),
-                    "fp": int(fp),
-                    "tn": int(tn),
-                    "fn": int(fn),
-                    "support": int(support),
+
+                # -------------------------
+                # MCC
+                # -------------------------
+                try:
+                    mcc = matthews_corrcoef(
+                        y_true_binary,
+                        y_pred_binary,
+                    )
+                    mcc = 0.0 if np.isnan(mcc) else float(mcc)
+
+                except ValueError:
+                    mcc = 0.0
+
+                pos_mcc_scores.append(mcc)
+
+                # -------------------------
+                # Other binary metrics
+                # -------------------------
+                binary_metrics = compute_binary_metrics(y_true_binary, y_pred_binary)
+
+                metrics["positive_macro"]["per_class"][idx2label[label_idx]] = {
+                    "tp": tp,
+                    "fp": fp,
+                    "tn": tn,
+                    "fn": fn,
+                    "support": support,
+                    "mcc": mcc,
                     **binary_metrics,
                 }
-    
+
+            metrics["positive_macro"]["mcc"] = float(np.mean(pos_mcc_scores))
+
         else:
-            metrics["positive_macro"].update({
-                "mcc": 0.0,
-                "f1": 0.0,
-                "precision": 0.0,
-                "recall": 0.0,
-            })
+            metrics["positive_macro"].update(
+                {
+                    "mcc": 0.0,
+                    "f1": 0.0,
+                    "precision": 0.0,
+                    "recall": 0.0,
+                }
+            )
     # =========================================================================
     # 4. Binary 指标 (Non-vul (0) vs CWE-* (Rest))
     # =========================================================================
