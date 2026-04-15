@@ -37,6 +37,7 @@ MODEL_NAME = "microsoft/unixcoder-base"
 EMBEDDING_DIM = 768  # graphcodebert-base 的维度
 
 # 训练配置
+EMA_DECAY = 0.999
 BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
@@ -87,14 +88,15 @@ class Trainer:
         self.best_model_state = None
 
     def train_epoch(self, dataloader, epoch, geometric_median_max_iter=100):
+        # ==================== 第一阶段：标准训练循环 ====================
+        # 这个阶段只负责更新模型参数，不计算原型
         self.model.train()
         total_loss = 0.0
         num_batches = 0
 
-        # 或者，如果显存允许，可以直接存 Tensor 列表
-        feature_accumulator = {label: [] for label in range(self.model.num_classes)}
-
+        # 注意：这里不需要 feature_accumulator，因为我们不在这一步存特征
         pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training", leave=False)
+
         for batch in pbar:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
@@ -114,13 +116,32 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
-            features_cpu = features.detach().cpu()
-            labels_cpu = label_idxs.detach().cpu()
-            for f, l in zip(features_cpu, labels_cpu):
-                feature_accumulator[int(l)].append(f)
 
-        # --- 统计阶段优化 ---
+        avg_train_loss = total_loss / num_batches
+        log.print(f"Epoch {epoch} Training Phase Done. Avg Loss: {avg_train_loss:.4f}")
 
+        # ==================== 第二阶段：特征提取与原型计算 ====================
+        self.model.eval()  # 推荐设为 eval 模式，确保 BN/Dropout 稳定，或者保持 train 但用 no_grad
+        feature_accumulator = {label: [] for label in range(self.model.num_classes)}
+
+        pbar = tqdm(
+            dataloader, desc=f"Epoch {epoch} Computing Prototypes...", leave=False
+        )
+        with torch.no_grad():  # 冻结参数，不计算梯度
+            for batch in pbar:  # 重新遍历
+                input_ids = batch["input_ids"].to(DEVICE)
+                attention_mask = batch["attention_mask"].to(DEVICE)
+                label_idxs = batch["label_idx"].to(DEVICE)
+                _, features = self.model(
+                    input_ids, attention_mask, return_features=True
+                )
+                features_cpu = features.detach().cpu()
+                labels_cpu = label_idxs.detach().cpu()
+
+                for f, l in zip(features_cpu, labels_cpu):
+                    feature_accumulator[int(l)].append(f)
+
+        # ==================== 第三阶段：计算原型 ====================
         D = features.shape[1]
         C = self.model.num_classes
 
@@ -129,19 +150,25 @@ class Trainer:
         kappas_list = []
         class_counts_list = []
 
-        # 预分配张量列表，避免动态扩容
         for label_idx in range(C):
             feats = feature_accumulator[label_idx]
+            if len(feats) == 0:
+                # 处理空类别的边界情况（虽然训练集通常不会出现）
+                log.print(f"Warning: No samples for class {label_idx}")
+                mean_prototypes_list.append(torch.zeros(D))
+                geom_median_prototypes_list.append(torch.zeros(D))
+                kappas_list.append(torch.tensor(0.0))
+                class_counts_list.append(0)
+                continue
 
-            # 1. 一次性堆叠，效率更高
+            # 1. 堆叠并归一化
             feats_tensor = torch.stack(feats, dim=0)  # [N, D]
-            class_counts_list.append(len(feats))  # 记录实际参与训练的样本数
+            class_counts_list.append(len(feats))
 
-            # 2. 只进行一次归一化，复用结果
-            # 注意：geometric median 和 kappa 计算通常都需要单位向量
+            # 2. 归一化 (vMF 分布通常基于单位球面)
             feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=1)
 
-            # Mean Prototype (在归一化前或后计算取决于你的定义，通常 Mean of Normals 是标准做法)
+            # Mean Prototype
             mean_proto = F.normalize(feats_tensor_norm.mean(dim=0), dim=0)
             mean_prototypes_list.append(mean_proto)
 
@@ -152,31 +179,27 @@ class Trainer:
             geom_median_proto = F.normalize(geom_median_proto, dim=0)
             geom_median_prototypes_list.append(geom_median_proto)
 
-            # Kappa (复用上面的 feats_tensor_norm)
+            # Kappa
             kappa = compute_vmf_kappa(feats_tensor_norm, D)
             kappas_list.append(kappa)
 
-        # 拼成 [C, D] 张量 (注意维度顺序，通常类别在前更方便索引)
+        # ==================== 第四阶段：更新模型属性 ====================
         self.model.current_mean_prototypes = torch.stack(
             mean_prototypes_list, dim=0
         ).to(DEVICE)
-
         self.model.current_geometric_median_prototypes = torch.stack(
             geom_median_prototypes_list, dim=0
         ).to(DEVICE)
-
         self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
         self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
-        self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
-
-        # 我明明在这里面更新了 params 自适应参数
         self.model.loss_head.update_adaptive_params(
             self.model.current_kappas,
             self.model.class_counts,
             self.model.current_mean_prototypes,
         )
 
-        return total_loss / num_batches
+        log.print(f"Epoch {epoch} Prototypes Updated.")
+        return avg_train_loss
 
     def evaluate_epoch(self, dataloader, epoch, save_prefix="val"):
         """评估模型"""
@@ -206,9 +229,7 @@ class Trainer:
             json.dump(metrics, f, indent=2)
 
         # 打印指标
-        log.print(
-            f"\nEpoch {epoch} Evaluation Results: =========================================="
-        )
+        log.print(f"\nEpoch {epoch} Evaluation Results:")
         log.print("Classification Metrics: ---------------------------------")
         log.print(
             f"🐱 Binary - MCC: {classification_metrics['binary']['mcc']:.4f}, F1: {classification_metrics['binary']['f1']:.4f}, "
@@ -294,14 +315,12 @@ class Trainer:
                 batch_size=BATCH_SIZE,
                 shuffle=True,
                 generator=g,
-                num_workers=4,
                 pin_memory=True,
             )
             val_loader = DataLoader(
                 self.model.val_dataset,
                 batch_size=BATCH_SIZE,
                 shuffle=False,
-                num_workers=4,
                 pin_memory=True,
             )
 
@@ -385,6 +404,7 @@ def main():
     model = MARGINModel(
         backbone=MODEL_NAME,
         base_scale=BASE_SCALE,
+        ema_decay=EMA_DECAY,
         alpha=CONFIDENCE_ALPHA,
         train_dataset=train_dataset,
         val_dataset=test_dataset,

@@ -50,7 +50,7 @@ def compute_margin(
     # ETF Voronoi cone angle
     theta_voronoi_cell = 0.5 * math.acos(-1 / (n - 1))
 
-    margin = theta_vmf - theta_voronoi_cell
+    margin = max(theta_vmf - theta_voronoi_cell, 0)
 
     return margin
 

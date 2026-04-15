@@ -54,9 +54,19 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
     # ===============================
     metrics["global_macro"] = {
         "mcc": float(matthews_corrcoef(truth_label_idx, pred_label_idx)),
-        "f1": float(f1_score(truth_label_idx, pred_label_idx, average="macro", zero_division=0)),
-        "precision": float(precision_score(truth_label_idx, pred_label_idx, average="macro", zero_division=0)),
-        "recall": float(recall_score(truth_label_idx, pred_label_idx, average="macro", zero_division=0)),
+        "f1": float(
+            f1_score(truth_label_idx, pred_label_idx, average="macro", zero_division=0)
+        ),
+        "precision": float(
+            precision_score(
+                truth_label_idx, pred_label_idx, average="macro", zero_division=0
+            )
+        ),
+        "recall": float(
+            recall_score(
+                truth_label_idx, pred_label_idx, average="macro", zero_division=0
+            )
+        ),
         "accuracy": float(accuracy_score(truth_label_idx, pred_label_idx)),
         "per_class": {},
     }
@@ -64,7 +74,9 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
     fnr_list, fpr_list = [], []
 
     for c in all_label_idx:
-        tp, fp, tn, fn, y_true_bin, y_pred_bin = ova_confusion(truth_label_idx, pred_label_idx, c)
+        tp, fp, tn, fn, y_true_bin, y_pred_bin = ova_confusion(
+            truth_label_idx, pred_label_idx, c
+        )
 
         fnr = fn / (fn + tp) if (fn + tp) > 0 else 0.0
         fpr = fp / (fp + tn) if (fp + tn) > 0 else 0.0
@@ -80,7 +92,11 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
             if (precision + recall) > 0
             else 0.0
         )
-        mcc = matthews_corrcoef(y_true_bin, y_pred_bin) if (tp + fp + fn + tn) > 0 else 0.0
+        mcc = (
+            matthews_corrcoef(y_true_bin, y_pred_bin)
+            if (tp + fp + fn + tn) > 0
+            else 0.0
+        )
 
         label_name = idx2label[c]
         metrics["global_macro"]["per_class"][label_name] = {
@@ -99,69 +115,46 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
     metrics["global_macro"]["fpr"] = float(np.mean(fpr_list))
 
     # ===============================
-    # POSITIVE MACRO (FULL OVA)
-    # CWE-only evaluation but FULL dataset OVA
+    # POSITIVE MACRO
+    # 从 global_macro 中提取正类指标再平均
     # ===============================
     positive_label_idx = [l for l in all_label_idx if l != 0]
-    metrics["positive_macro"] = {"per_class": {}}
 
     if len(positive_label_idx) > 0:
 
-        pos_mcc_list = []
+        pos_precisions = []
+        pos_recalls = []
+        pos_f1s = []
+        pos_mccs = []
+
+        per_class_metrics = {}
 
         for c in positive_label_idx:
+            label_name = idx2label[c]
 
-            tp, fp, tn, fn, y_true_bin, y_pred_bin = ova_confusion(
-                truth_label_idx,
-                pred_label_idx,
-                c,
-            )
+            cls_metrics = metrics["global_macro"]["per_class"][label_name]
 
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-            f1 = (
-                2 * precision * recall / (precision + recall)
-                if (precision + recall) > 0
-                else 0.0
-            )
+            per_class_metrics[label_name] = cls_metrics
 
-            mcc = matthews_corrcoef(y_true_bin, y_pred_bin)
-            mcc = 0.0 if np.isnan(mcc) else float(mcc)
+            pos_precisions.append(cls_metrics["precision"])
+            pos_recalls.append(cls_metrics["recall"])
+            pos_f1s.append(cls_metrics["f1"])
+            pos_mccs.append(cls_metrics["mcc"])
 
-            pos_mcc_list.append(mcc)
-
-            metrics["positive_macro"]["per_class"][idx2label[c]] = {
-                "tp": tp,
-                "fp": fp,
-                "tn": tn,
-                "fn": fn,
-                "support": int(tp + fn),
-                "precision": precision,
-                "recall": recall,
-                "f1": f1,
-                "mcc": mcc,
-            }
-
-        metrics["positive_macro"]["mcc"] = float(np.mean(pos_mcc_list))
-        metrics["positive_macro"]["precision"] = float(
-            np.mean([metrics["positive_macro"]["per_class"][idx2label[c]]["precision"]
-                     for c in positive_label_idx])
-        )
-        metrics["positive_macro"]["recall"] = float(
-            np.mean([metrics["positive_macro"]["per_class"][idx2label[c]]["recall"]
-                     for c in positive_label_idx])
-        )
-        metrics["positive_macro"]["f1"] = float(
-            np.mean([metrics["positive_macro"]["per_class"][idx2label[c]]["f1"]
-                     for c in positive_label_idx])
-        )
+        metrics["positive_macro"] = {
+            "precision": float(np.mean(pos_precisions)),
+            "recall": float(np.mean(pos_recalls)),
+            "f1": float(np.mean(pos_f1s)),
+            "mcc": float(np.mean(pos_mccs)),
+            "per_class": per_class_metrics,
+        }
 
     else:
         metrics["positive_macro"] = {
-            "mcc": 0.0,
             "precision": 0.0,
             "recall": 0.0,
             "f1": 0.0,
+            "mcc": 0.0,
             "per_class": {},
         }
 
@@ -197,6 +190,7 @@ def compute_classification_metrics(truth_label_idx, pred_label_idx, idx2label: d
     }
 
     return metrics
+
 
 def compute_clustering_metrics(truth_label_idx, pred_label_idx, features=None):
     truth_label_idx = np.array(truth_label_idx)

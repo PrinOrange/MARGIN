@@ -14,6 +14,7 @@ class MARGINModel(nn.Module):
         self,
         backbone: str,
         base_scale: float,
+        ema_decay: float,
         alpha: float,
         train_dataset: CodeDataset,
         val_dataset: CodeDataset,
@@ -42,7 +43,7 @@ class MARGINModel(nn.Module):
         self.id2label = train_dataset.idx2label
 
         self.loss_head: MARGINLossHead = MARGINLossHead(
-            self.num_classes, base_scale, alpha, self.embedding_dim
+            self.num_classes, base_scale, ema_decay, alpha, self.embedding_dim
         )
 
     def forward(self, input_ids, attention_mask, return_features=False):
@@ -63,10 +64,18 @@ class MARGINModel(nn.Module):
 # ==================== ArcFace Loss with Adaptive Margin ====================
 class MARGINLossHead(nn.Module):
 
-    def __init__(self, num_classes, base_scale: int, alpha: float, dim: int):
+    def __init__(
+        self,
+        num_classes: int,
+        base_scale: int,
+        ema_decay: float,
+        alpha: float,
+        dim: int,
+    ):
         super().__init__()
         self.num_classes = num_classes
         self.base_scale = base_scale
+        self.ema_decay = ema_decay
         self.dim = dim
         self.alpha = alpha
 
@@ -82,27 +91,20 @@ class MARGINLossHead(nn.Module):
         class_counts: torch.Tensor,
         mean_prototypes: torch.Tensor,
     ):
-        """
-        kappas: [C]
-        mean_prototypes: [C, D]
-        返回：
-            margins: [C]
-            scales: [C]
-        """
         device = kappas.device
         C = self.num_classes
-        # --- 防止数值问题 ---
+
         kappas = torch.clamp(kappas, min=1e-6)
+
         kappa_min = kappas.min()
         kappa_max = kappas.max()
-        kappas_norm = (kappas - kappa_min) / (kappa_max - kappa_min + 1e-8)
-        scales_weight = 2 - kappas_norm
-        scales = self.base_scale * scales_weight
-        # 如果你想固定 scale
-        # scales = torch.full_like(scales, 30.0)
 
-        # --- 计算 margins ---
-        margins = torch.zeros(C, device=device)
+        kappas_norm = (kappas - kappa_min) / (kappa_max - kappa_min + 1e-8)
+
+        scales_weight = 1 - 0.5 * kappas_norm
+        new_scales = self.base_scale * scales_weight
+
+        new_margins = torch.zeros(C, device=device)
 
         for i in range(C):
             count_i = class_counts[i]
@@ -114,17 +116,23 @@ class MARGINLossHead(nn.Module):
                 kappa_i,
                 self.dim,
             )
-            margins[i] = margin
 
-        self.margins = margins
-        self.kappas = kappas
-        self.scales = scales
+            new_margins[i] = margin
 
-        log.print(f"Updated margins: {margins}")
-        log.print(f"Updated scales: {scales}")
-        log.print(f"Updated kappas: {kappas}")
+        # ========================
+        # EMA UPDATE
+        # ========================
+        alpha = self.ema_decay
 
-        return margins, scales
+        self.margins = alpha * self.margins + (1 - alpha) * new_margins
+        self.scales = alpha * self.scales + (1 - alpha) * new_scales
+        self.kappas = alpha * self.kappas + (1 - alpha) * kappas
+
+        log.print(f"Updated margins: {self.margins}")
+        log.print(f"Updated scales: {self.scales}")
+        log.print(f"Updated kappas: {self.kappas}")
+
+        return self.margins, self.scales
 
     def forward(self, cos_theta, label_idxs):
         B, C = cos_theta.shape
