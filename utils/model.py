@@ -4,7 +4,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoConfig, AutoModelForTextEncoding
 from utils.dataset import CodeDataset
-from utils.math import compute_pairwise_margin, compute_margin
+from utils.math import (
+    compute_pairwise_margin,
+    compute_margin,
+    compute_convergence_coefficient,
+)
 from utils.logger import log
 
 
@@ -79,6 +83,8 @@ class MARGINLossHead(nn.Module):
         self.dim = dim
         self.alpha = alpha
 
+        self.is_initialized = False
+
         self.register_buffer("margins", torch.zeros(num_classes))
         self.register_buffer("kappas", torch.zeros(num_classes))
         self.register_buffer(
@@ -105,6 +111,7 @@ class MARGINLossHead(nn.Module):
         new_scales = self.base_scale * scales_weight
 
         new_margins = torch.zeros(C, device=device)
+        # betas = torch.zeros(C, device=device)
 
         for i in range(C):
             count_i = class_counts[i]
@@ -115,19 +122,34 @@ class MARGINLossHead(nn.Module):
                 count_i,
                 kappa_i,
                 self.dim,
+                self.alpha,
             )
-
+            # convergence_coeff = compute_convergence_coefficient(
+            #     self.num_classes,
+            #     count_i,
+            #     kappa_i,
+            #     self.dim,
+            #     self.alpha,
+            # )
+            # betas[i] = 1 - math.sqrt(convergence_coeff)
             new_margins[i] = margin
 
         # ========================
-        # EMA UPDATE
+        # Cosine UPDATE
         # ========================
-        alpha = self.ema_decay
 
-        self.margins = alpha * self.margins + (1 - alpha) * new_margins
-        self.scales = alpha * self.scales + (1 - alpha) * new_scales
-        self.kappas = alpha * self.kappas + (1 - alpha) * kappas
+        self.kappas = kappas
+        self.margins = new_margins
+        self.scales = new_scales
+        # if not self.is_initialized:
+        #     self.margins = new_margins
+        #     self.scales = new_scales
+        #     self.is_initialized = True
+        # else:
+        #     self.margins = new_margins * betas + self.margins * (1 - betas)
+        #     self.scales = new_scales * betas + self.scales * (1 - betas)
 
+        # log.print(f"Updated betas: {betas}")
         log.print(f"Updated margins: {self.margins}")
         log.print(f"Updated scales: {self.scales}")
         log.print(f"Updated kappas: {self.kappas}")

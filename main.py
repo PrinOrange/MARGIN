@@ -2,6 +2,7 @@ import json
 import os
 import warnings
 from datetime import datetime
+import time
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -37,7 +38,7 @@ MODEL_NAME = "microsoft/unixcoder-base"
 EMBEDDING_DIM = 768  # graphcodebert-base 的维度
 
 # 训练配置
-EMA_DECAY = 0.999
+EMA_DECAY = 0.9
 BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
@@ -46,7 +47,7 @@ EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 SCHEDULER_PATIENCE = 3
 
 # ArcFace & 球面配置
-BASE_SCALE = 20  # s
+BASE_SCALE = 30  # s
 CONFIDENCE_ALPHA = 0.95  # α
 SEED = 42
 
@@ -88,15 +89,20 @@ class Trainer:
         self.best_model_state = None
 
     def train_epoch(self, dataloader, epoch, geometric_median_max_iter=100):
-        # ==================== 第一阶段：标准训练循环 ====================
-        # 这个阶段只负责更新模型参数，不计算原型
         self.model.train()
         total_loss = 0.0
         num_batches = 0
 
-        # 注意：这里不需要 feature_accumulator，因为我们不在这一步存特征
-        pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training", leave=False)
+        # 或者，如果显存允许，可以直接存 Tensor 列表
+        feature_accumulator = {label: [] for label in range(self.model.num_classes)}
 
+        # --- 记录开始时间 ---
+        start_time = time.time()
+        log.print(
+            f"⏱️ Epoch {epoch} Training started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}"
+        )
+
+        pbar = tqdm(dataloader, desc=f"Epoch {epoch} Training", leave=False)
         for batch in pbar:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
@@ -116,32 +122,13 @@ class Trainer:
             total_loss += loss.item()
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            features_cpu = features.detach().cpu()
+            labels_cpu = label_idxs.detach().cpu()
+            for f, l in zip(features_cpu, labels_cpu):
+                feature_accumulator[int(l)].append(f)
 
-        avg_train_loss = total_loss / num_batches
-        log.print(f"Epoch {epoch} Training Phase Done. Avg Loss: {avg_train_loss:.4f}")
+        # --- 统计阶段优化 ---
 
-        # ==================== 第二阶段：特征提取与原型计算 ====================
-        self.model.eval()  # 推荐设为 eval 模式，确保 BN/Dropout 稳定，或者保持 train 但用 no_grad
-        feature_accumulator = {label: [] for label in range(self.model.num_classes)}
-
-        pbar = tqdm(
-            dataloader, desc=f"Epoch {epoch} Computing Prototypes...", leave=False
-        )
-        with torch.no_grad():  # 冻结参数，不计算梯度
-            for batch in pbar:  # 重新遍历
-                input_ids = batch["input_ids"].to(DEVICE)
-                attention_mask = batch["attention_mask"].to(DEVICE)
-                label_idxs = batch["label_idx"].to(DEVICE)
-                _, features = self.model(
-                    input_ids, attention_mask, return_features=True
-                )
-                features_cpu = features.detach().cpu()
-                labels_cpu = label_idxs.detach().cpu()
-
-                for f, l in zip(features_cpu, labels_cpu):
-                    feature_accumulator[int(l)].append(f)
-
-        # ==================== 第三阶段：计算原型 ====================
         D = features.shape[1]
         C = self.model.num_classes
 
@@ -150,25 +137,19 @@ class Trainer:
         kappas_list = []
         class_counts_list = []
 
+        # 预分配张量列表，避免动态扩容
         for label_idx in range(C):
             feats = feature_accumulator[label_idx]
-            if len(feats) == 0:
-                # 处理空类别的边界情况（虽然训练集通常不会出现）
-                log.print(f"Warning: No samples for class {label_idx}")
-                mean_prototypes_list.append(torch.zeros(D))
-                geom_median_prototypes_list.append(torch.zeros(D))
-                kappas_list.append(torch.tensor(0.0))
-                class_counts_list.append(0)
-                continue
 
-            # 1. 堆叠并归一化
+            # 1. 一次性堆叠，效率更高
             feats_tensor = torch.stack(feats, dim=0)  # [N, D]
-            class_counts_list.append(len(feats))
+            class_counts_list.append(len(feats))  # 记录实际参与训练的样本数
 
-            # 2. 归一化 (vMF 分布通常基于单位球面)
+            # 2. 只进行一次归一化，复用结果
+            # 注意：geometric median 和 kappa 计算通常都需要单位向量
             feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=1)
 
-            # Mean Prototype
+            # Mean Prototype (在归一化前或后计算取决于你的定义，通常 Mean of Normals 是标准做法)
             mean_proto = F.normalize(feats_tensor_norm.mean(dim=0), dim=0)
             mean_prototypes_list.append(mean_proto)
 
@@ -179,31 +160,49 @@ class Trainer:
             geom_median_proto = F.normalize(geom_median_proto, dim=0)
             geom_median_prototypes_list.append(geom_median_proto)
 
-            # Kappa
+            # Kappa (复用上面的 feats_tensor_norm)
             kappa = compute_vmf_kappa(feats_tensor_norm, D)
             kappas_list.append(kappa)
 
-        # ==================== 第四阶段：更新模型属性 ====================
+        # 拼成 [C, D] 张量 (注意维度顺序，通常类别在前更方便索引)
         self.model.current_mean_prototypes = torch.stack(
             mean_prototypes_list, dim=0
         ).to(DEVICE)
+
         self.model.current_geometric_median_prototypes = torch.stack(
             geom_median_prototypes_list, dim=0
         ).to(DEVICE)
+
         self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
         self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
+        self.model.current_kappas = torch.stack(kappas_list).to(DEVICE)  # [C]
+
+        # 我明明在这里面更新了 params 自适应参数
         self.model.loss_head.update_adaptive_params(
             self.model.current_kappas,
             self.model.class_counts,
             self.model.current_mean_prototypes,
         )
 
-        log.print(f"Epoch {epoch} Prototypes Updated.")
-        return avg_train_loss
+        # --- 记录结束时间和耗时 ---
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        log.print(
+            f"✅ Epoch {epoch} Training finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}"
+        )
+        log.print(f"⏳ Epoch {epoch} Training costs {elapsed_time:.2f} seconds.")
+
+        return total_loss / num_batches
 
     def evaluate_epoch(self, dataloader, epoch, save_prefix="val"):
         """评估模型"""
         self.model.eval()
+
+        # --- 记录开始时间 ---
+        start_time = time.time()
+        log.print(
+            f"⏱️  Epoch {epoch} Evaluation started at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(start_time))}"
+        )
 
         (
             metrics,
@@ -229,7 +228,7 @@ class Trainer:
             json.dump(metrics, f, indent=2)
 
         # 打印指标
-        log.print(f"\nEpoch {epoch} Evaluation Results:")
+        log.print(f"Epoch {epoch} Evaluation Results:")
         log.print("Classification Metrics: ---------------------------------")
         log.print(
             f"🐱 Binary - MCC: {classification_metrics['binary']['mcc']:.4f}, F1: {classification_metrics['binary']['f1']:.4f}, "
@@ -265,6 +264,15 @@ class Trainer:
 
         # 绘制可视化
         self.visualize_epoch(all_features, all_truth_label_idx, epoch)
+
+        # --- 记录结束时间和耗时 ---
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        log.print(
+            f"✅ Epoch {epoch} Evaluation finished at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(end_time))}"
+        )
+        log.print(f"⏳ Epoch {epoch} Evaluation costs: {elapsed_time:.2f} seconds")
+
         return avg_loss, metrics
 
     def visualize_epoch(self, features, truth_label_idx, epoch):
@@ -326,7 +334,7 @@ class Trainer:
 
             # 训练（内部已更新 stats）
             train_loss = self.train_epoch(train_loader, epoch)
-            log.print(f"\nTrain Loss: {train_loss:.4f}")
+            log.print(f"Train Loss: {train_loss:.4f}")
 
             # 注意：geometric_medians 已在 train_epoch 结尾更新，可直接用于 evaluate
             avg_val_loss, val_metrics = self.evaluate_epoch(val_loader, epoch)
@@ -352,7 +360,7 @@ class Trainer:
                     f"No improvement. Patience: {self.patience_counter}/{EARLY_STOPPING_PATIENCE}"
                 )
                 if self.patience_counter >= EARLY_STOPPING_PATIENCE:
-                    log.print(f"\nEarly stopping triggered at epoch {epoch}")
+                    log.print(f"Early stopping triggered at epoch {epoch}")
                     break
             if self.best_model_state is not None:
                 best_epoch = self.best_model_state["epoch"]
@@ -365,7 +373,7 @@ class Trainer:
 
         if self.best_model_state is not None:
             log.print(
-                f"\nLoading best model from epoch {self.best_model_state['epoch']}"
+                f"Loading best model from epoch {self.best_model_state['epoch']}"
             )
             self.model.load_state_dict(self.best_model_state["model_state_dict"])
 

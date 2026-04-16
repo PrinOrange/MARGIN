@@ -50,9 +50,26 @@ def compute_margin(
     # ETF Voronoi cone angle
     theta_voronoi_cell = 0.5 * math.acos(-1 / (n - 1))
 
-    margin = max(theta_vmf - theta_voronoi_cell, 0)
-
+    margin = max(0, theta_vmf - theta_voronoi_cell)
+    # return 0.3
     return margin
+
+
+def compute_convergence_coefficient(
+    n: int, count_i: int, kappa_i: float, dim: int, alpha: float = 0.95
+):
+    # predictive uncertainty
+    q = chi2.ppf(alpha, df=dim - 1)
+
+    kappa_i_eff = kappa_i * count_i / (count_i + 1)
+
+    theta_vmf = math.sqrt(q / kappa_i_eff)
+
+    # ETF Voronoi cone angle
+    theta_voronoi_cell = 0.5 * math.acos(-1 / (n - 1))
+    convergence_coeff = theta_voronoi_cell / (theta_vmf)
+    convergence_coeff = max(0.0, min(1.0, convergence_coeff))
+    return convergence_coeff
 
 
 def compute_pairwise_margin(
