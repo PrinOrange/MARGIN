@@ -8,8 +8,8 @@ def compute_vmf_kappa(features, dim):
     """
     改进的 κ 估计，使用更稳定的数值方法
     """
-    r_bar = features.mean(dim=0)
-    R = r_bar.norm().item()
+    mu = F.normalize(features.mean(dim=0), dim=0)
+    R = (features @ mu).mean()
 
     # 防止边界情况
     R = min(R, 0.999999)

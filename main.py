@@ -30,16 +30,16 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "debug"  # 可选其他 subset
+DATASET_SUBSET = "megavul"  # 可选其他 subset
 MAX_LENGTH = 512
 
 # 模型配置
-MODEL_NAME = "microsoft/unixcoder-base"
+MODEL_NAME = "Salesforce/codet5-base"
 EMBEDDING_DIM = 768  # graphcodebert-base 的维度
 
 # 训练配置
 EMA_DECAY = 0.9
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 MAX_EPOCHS = 200
@@ -372,9 +372,7 @@ class Trainer:
                 )  # 第一轮的情况
 
         if self.best_model_state is not None:
-            log.print(
-                f"Loading best model from epoch {self.best_model_state['epoch']}"
-            )
+            log.print(f"Loading best model from epoch {self.best_model_state['epoch']}")
             self.model.load_state_dict(self.best_model_state["model_state_dict"])
 
         return self.model
