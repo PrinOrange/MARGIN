@@ -161,11 +161,6 @@ class MARGINLossHead(nn.Module):
         target_sin = torch.sqrt(torch.clamp(1.0 - target_cos**2, min=1e-7))
         # cos(θ + m)
         target_cos_margin = target_cos * cos_m - target_sin * sin_m
-        th = torch.cos(math.pi - margins_batch)
-        mm = torch.sin(math.pi - margins_batch) * margins_batch
-        target_cos_margin = torch.where(
-            target_cos > th, target_cos_margin, target_cos - mm
-        )
         target_cos_margin = target_cos_margin.to(cos_thetas.dtype)
         logits = cos_thetas.clone()
         logits[torch.arange(B, device=device), label_idxs] = target_cos_margin
