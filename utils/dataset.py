@@ -14,18 +14,13 @@ class CodeDataset(Dataset):
         self._build_label_mapping()
 
     def _build_label_mapping(self):
-        label_counts = Counter(self.dataset["label"])
-        # 按频率降序排序
+        labels = list(set(self.dataset["label"]))
+    
         sorted_labels = sorted(
-            label_counts.keys(),
-            key=lambda x: label_counts[x],
-            reverse=True,
+            labels,
+            key=lambda x: (x != "Non-vul", x)
         )
-        # 强制 Non-vul 放最前
-        if "Non-vul" in sorted_labels:
-            sorted_labels.remove("Non-vul")
-            sorted_labels.insert(0, "Non-vul")
-
+    
         for idx, label in enumerate(sorted_labels):
             self.label2idx[label] = idx
             self.idx2label[idx] = label

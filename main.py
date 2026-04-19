@@ -34,17 +34,16 @@ DATASET_SUBSET = "bigvul"  # 可选其他 subset
 MAX_LENGTH = 512
 
 # 模型配置
-MODEL_NAME = "microsoft/unixcoder-base"
+MODEL_NAME = "Salesforce/codet5-base"  # 可选其他 backbone
 EMBEDDING_DIM = 768  # graphcodebert-base 的维度
 
 # 训练配置
 EMA_DECAY = 0.9
-BATCH_SIZE = 32
+BATCH_SIZE = 16
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 MAX_EPOCHS = 200
 EARLY_STOPPING_PATIENCE = MAX_EPOCHS
-SCHEDULER_PATIENCE = 3
 
 # ArcFace & 球面配置
 BASE_SCALE = 30  # s
@@ -106,14 +105,14 @@ class Trainer:
         for batch in pbar:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
-            label_idxs = batch["label_idx"].to(DEVICE)
-
+            label_idx = batch["label_idx"].to(DEVICE)
+            
             self.optimizer.zero_grad()
             with autocast(DEVICE):
                 cos_theta, features = self.model(
                     input_ids, attention_mask, return_features=True
                 )
-                loss = self.model.loss_head(cos_theta, label_idxs)
+                loss = self.model.loss_head(cos_theta, label_idx)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
@@ -123,7 +122,7 @@ class Trainer:
             num_batches += 1
             pbar.set_postfix({"loss": f"{loss.item():.4f}"})
             features_cpu = features.detach().cpu()
-            labels_cpu = label_idxs.detach().cpu()
+            labels_cpu = label_idx.detach().cpu()
             for f, l in zip(features_cpu, labels_cpu):
                 feature_accumulator[int(l)].append(f)
 
@@ -136,50 +135,51 @@ class Trainer:
         geom_median_prototypes_list = []
         kappas_list = []
         class_counts_list = []
-
-        # 预分配张量列表，避免动态扩容
-        for label_idx in range(C):
-            feats = feature_accumulator[label_idx]
-
-            # 1. 一次性堆叠，效率更高
-            feats_tensor = torch.stack(feats, dim=0)  # [N, D]
-            class_counts_list.append(len(feats))  # 记录实际参与训练的样本数
-
-            # 2. 只进行一次归一化，复用结果
-            # 注意：geometric median 和 kappa 计算通常都需要单位向量
-            feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=1)
-
-            # Mean Prototype (在归一化前或后计算取决于你的定义，通常 Mean of Normals 是标准做法)
-            mean_proto = F.normalize(feats_tensor_norm.mean(dim=0), dim=0)
-            mean_prototypes_list.append(mean_proto)
-
-            # Geometric Median Prototype
-            geom_median_proto = compute_geometric_median(feats_tensor_norm)
-            geom_median_proto = F.normalize(geom_median_proto, dim=0)
-            geom_median_prototypes_list.append(geom_median_proto)
-
-            # Kappa (复用上面的 feats_tensor_norm)
-            kappa = compute_vmf_kappa(feats_tensor_norm, mean_proto)
-            kappas_list.append(kappa)
-
-        # 拼成 [C, D] 张量 (注意维度顺序，通常类别在前更方便索引)
-        self.model.current_mean_prototypes = torch.stack(
-            mean_prototypes_list, dim=0
-        ).to(DEVICE)
-
-        self.model.current_geometric_median_prototypes = torch.stack(
-            geom_median_prototypes_list, dim=0
-        ).to(DEVICE)
-
-        self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
-        self.model.current_kappas = torch.tensor(kappas_list).to(DEVICE)  # [C]
-
-        # 我明明在这里面更新了 params 自适应参数
-        self.model.loss_head.update_adaptive_params(
-            self.model.current_kappas,
-            self.model.class_counts,
-            self.model.current_mean_prototypes,
-        )
+        
+        with torch.no_grad():
+            # 预分配张量列表，避免动态扩容
+            for label_idx in range(C):
+                feats = feature_accumulator[label_idx]
+    
+                # 1. 一次性堆叠，效率更高
+                feats_tensor = torch.stack(feats, dim=0)  # [N, D]
+                class_counts_list.append(len(feats))  # 记录实际参与训练的样本数
+    
+                # 2. 只进行一次归一化，复用结果
+                # 注意：geometric median 和 kappa 计算通常都需要单位向量
+                feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=1)
+    
+                # Mean Prototype (在归一化前或后计算取决于你的定义，通常 Mean of Normals 是标准做法)
+                mean_proto = F.normalize(feats_tensor_norm.mean(dim=0), dim=0)
+                mean_prototypes_list.append(mean_proto)
+    
+                # Geometric Median Prototype
+                geom_median_proto = compute_geometric_median(feats_tensor_norm)
+                geom_median_proto = F.normalize(geom_median_proto, dim=0)
+                geom_median_prototypes_list.append(geom_median_proto)
+    
+                # Kappa (复用上面的 feats_tensor_norm)
+                kappa = compute_vmf_kappa(feats_tensor_norm, mean_proto)
+                kappas_list.append(kappa)
+    
+            # 拼成 [C, D] 张量 (注意维度顺序，通常类别在前更方便索引)
+            self.model.current_mean_prototypes = torch.stack(
+                mean_prototypes_list, dim=0
+            ).to(DEVICE)
+    
+            self.model.current_geometric_median_prototypes = torch.stack(
+                geom_median_prototypes_list, dim=0
+            ).to(DEVICE)
+    
+            self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
+            self.model.current_kappas = torch.tensor(kappas_list).to(DEVICE)  # [C]
+    
+            # 我明明在这里面更新了 params 自适应参数
+            self.model.loss_head.update_adaptive_params(
+                self.model.current_kappas,
+                self.model.class_counts,
+                self.model.current_mean_prototypes,
+            )
 
         # --- 记录结束时间和耗时 ---
         end_time = time.time()
@@ -309,7 +309,7 @@ class Trainer:
         )
 
     def train(self):
-        for epoch in range(1, MAX_EPOCHS + 1):
+        for epoch in range(0, MAX_EPOCHS + 1):
             log.print(f"\n{'='*50}")
             log.print(f"Epoch {epoch}/{MAX_EPOCHS}")
             log.print(f"{'='*50}")
@@ -407,7 +407,6 @@ def main():
     model = MARGINModel(
         backbone=MODEL_NAME,
         base_scale=BASE_SCALE,
-        ema_decay=EMA_DECAY,
         alpha=CONFIDENCE_ALPHA,
         train_dataset=train_dataset,
         val_dataset=test_dataset,
