@@ -323,13 +323,11 @@ class Trainer:
                 batch_size=BATCH_SIZE,
                 shuffle=True,
                 generator=g,
-                pin_memory=True,
             )
             val_loader = DataLoader(
                 self.model.val_dataset,
                 batch_size=BATCH_SIZE,
                 shuffle=False,
-                pin_memory=True,
             )
 
             # 训练（内部已更新 stats）
