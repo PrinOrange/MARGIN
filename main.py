@@ -34,7 +34,7 @@ DATASET_SUBSET = "reposvul"  # 可选其他 subset
 MAX_LENGTH = 512
 
 # 模型配置
-MODEL_NAME = "microsoft/unixcoder-base-nine"  # 可选其他 backbone
+MODEL_NAME = "Salesforce/codet5-base"  # 可选其他 backbone
 # microsoft/graphcodebert-base
 # microsoft/unixcoder-base
 # microsoft/unixcoder-base-nine
@@ -42,19 +42,19 @@ MODEL_NAME = "microsoft/unixcoder-base-nine"  # 可选其他 backbone
 EMBEDDING_DIM = 768  # graphcodebert-base 的维度
 
 # 训练配置
-BATCH_SIZE = 16
+BATCH_SIZE = 32
 LEARNING_RATE = 2e-5
 WEIGHT_DECAY = 0.01
 MAX_EPOCHS = 200
 EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 
 # ArcFace & 球面配置
-BASE_SCALE = 30  # s
+BASE_SCALE = 20  # s
 CONFIDENCE_ALPHA = 0.95  # α
 SEED = 42
 
 # 设备配置
-DEVICE = "cuda:0"
+DEVICE = "cuda:2"
 TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 # 输出配置
 OUTPUT_DIR = f"./output/{DATASET_SUBSET}-{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"

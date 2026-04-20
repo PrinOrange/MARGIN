@@ -50,13 +50,13 @@ def compute_margin(
     theta_vmf = math.sqrt(q / kappa_i_eff)
 
     # ---- frequency-induced lower bound（采样分辨率极限）----
-    theta_freq = 0.5 * sigmoid(-count_i / math.sqrt(max_class_counts))
+    #theta_freq = 0.5 * sigmoid(-count_i / math.sqrt(max_class_counts))
 
     # ---- ETF Voronoi cone angle（类间分离）----
     theta_voronoi_cell = 0.5 * math.acos(-1 / (n - 1))
 
     # ---- final margin ----
-    margin = max(theta_freq, theta_vmf - theta_voronoi_cell)
+    margin = max(0, theta_vmf - theta_voronoi_cell)
 
     return margin
 
