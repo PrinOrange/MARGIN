@@ -86,7 +86,7 @@ class Trainer:
         )
         self.scaler = GradScaler()
 
-        self.best_global_mcc = float("-inf")
+        self.best_global_f1 = float("-inf")
         self.patience_counter = 0
         self.best_model_state = None
 
@@ -109,7 +109,7 @@ class Trainer:
             input_ids = batch["input_ids"].to(DEVICE)
             attention_mask = batch["attention_mask"].to(DEVICE)
             label_idx = batch["label_idx"].to(DEVICE)
-            
+
             self.optimizer.zero_grad()
             with autocast(DEVICE):
                 cos_theta, features = self.model(
@@ -138,45 +138,45 @@ class Trainer:
         geom_median_prototypes_list = []
         kappas_list = []
         class_counts_list = []
-        
+
         with torch.no_grad():
             # 预分配张量列表，避免动态扩容
             for label_idx in range(C):
                 feats = feature_accumulator[label_idx]
-    
+
                 # 1. 一次性堆叠，效率更高
                 feats_tensor = torch.stack(feats, dim=0)  # [N, D]
                 class_counts_list.append(len(feats))  # 记录实际参与训练的样本数
-    
+
                 # 2. 只进行一次归一化，复用结果
                 # 注意：geometric median 和 kappa 计算通常都需要单位向量
                 feats_tensor_norm = F.normalize(feats_tensor, p=2, dim=1)
-    
+
                 # Mean Prototype (在归一化前或后计算取决于你的定义，通常 Mean of Normals 是标准做法)
                 mean_proto = F.normalize(feats_tensor_norm.mean(dim=0), dim=0)
                 mean_prototypes_list.append(mean_proto)
-    
+
                 # Geometric Median Prototype
                 geom_median_proto = compute_geometric_median(feats_tensor_norm)
                 geom_median_proto = F.normalize(geom_median_proto, dim=0)
                 geom_median_prototypes_list.append(geom_median_proto)
-    
+
                 # Kappa (复用上面的 feats_tensor_norm)
                 kappa = compute_vmf_kappa(feats_tensor_norm, mean_proto)
                 kappas_list.append(kappa)
-    
+
             # 拼成 [C, D] 张量 (注意维度顺序，通常类别在前更方便索引)
             self.model.current_mean_prototypes = torch.stack(
                 mean_prototypes_list, dim=0
             ).to(DEVICE)
-    
+
             self.model.current_geometric_median_prototypes = torch.stack(
                 geom_median_prototypes_list, dim=0
             ).to(DEVICE)
-    
+
             self.model.class_counts = torch.tensor(class_counts_list).to(DEVICE)  # [C]
             self.model.current_kappas = torch.tensor(kappas_list).to(DEVICE)  # [C]
-    
+
             # 我明明在这里面更新了 params 自适应参数
             self.model.loss_head.update_adaptive_params(
                 self.model.current_kappas,
@@ -211,9 +211,7 @@ class Trainer:
             all_pred_label_idx,
             all_raw_labels,
             avg_loss,
-        ) = evaluate_model(
-            self.model, dataloader, f"Epoch {epoch} Evaluating", DEVICE
-        )
+        ) = evaluate_model(self.model, dataloader, f"Epoch {epoch} Evaluating", DEVICE)
 
         classification_metrics = metrics["classification_metrics"]
         clustering_metrics = metrics["clustering_metrics"]
@@ -336,20 +334,22 @@ class Trainer:
 
             # 注意：geometric_medians 已在 train_epoch 结尾更新，可直接用于 evaluate
             avg_val_loss, val_metrics = self.evaluate_epoch(val_loader, epoch)
-            val_global_mcc = val_metrics["classification_metrics"]["global_macro"][
-                "mcc"
-            ]
+            val_global_f1 = val_metrics["classification_metrics"]["global_macro"]["f1"]
             log.print(f"Val Loss: {avg_val_loss:.4f}")
 
-            # 早停逻辑不变
-            if val_global_mcc > self.best_global_mcc:
-                self.best_global_mcc = val_global_mcc
+            # 但是，现在我想改一下早停逻辑。
+            # 第一，用 val_metrics["classification_metrics"]["positive_macro"]["mcc"]
+            # 和 val_metrics["classification_metrics"]["binary"]["mcc"] 这两个指标的帕累托最优点作为监听依据。
+
+            # 早停逻辑
+            if val_global_f1 > self.best_global_f1:
+                self.best_global_f1 = val_global_f1
                 self.patience_counter = 0
                 self.best_model_state = {
                     "epoch": epoch,
                     "model_state_dict": self.model.state_dict(),
                     "optimizer_state_dict": self.optimizer.state_dict(),
-                    "val_global_mcc": val_global_mcc,
+                    "val_global_f1": val_global_f1,
                 }
                 log.print("Model improved, saved checkpoint.")
             else:
@@ -366,7 +366,7 @@ class Trainer:
                 log.print(f"🏆 Current Best: Epoch {best_epoch} | MCC {best_mcc:.4f}")
             else:
                 log.print(
-                    f"🏆 Current Best: Epoch {epoch} | MCC {val_global_mcc:.4f}"
+                    f"🏆 Current Best: Epoch {epoch} | MCC {val_global_f1:.4f}"
                 )  # 第一轮的情况
 
         if self.best_model_state is not None:

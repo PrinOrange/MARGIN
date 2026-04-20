@@ -39,9 +39,7 @@ def evaluate_model(model: MARGINModel, dataloader: DataLoader, title: str, devic
 
             # ✅ 强制单位球
             features = F.normalize(features, dim=1)
-            prototypes = F.normalize(
-                model.current_geometric_median_prototypes, dim=1
-            )
+            prototypes = F.normalize(model.current_geometric_median_prototypes, dim=1)
 
             # ✅ prototype 分类
             logits = torch.matmul(features, prototypes.t())

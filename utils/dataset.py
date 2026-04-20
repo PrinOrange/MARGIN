@@ -15,12 +15,9 @@ class CodeDataset(Dataset):
 
     def _build_label_mapping(self):
         labels = list(set(self.dataset["label"]))
-    
-        sorted_labels = sorted(
-            labels,
-            key=lambda x: (x != "Non-vul", x)
-        )
-    
+
+        sorted_labels = sorted(labels, key=lambda x: (x != "Non-vul", x))
+
         for idx, label in enumerate(sorted_labels):
             self.label2idx[label] = idx
             self.idx2label[idx] = label

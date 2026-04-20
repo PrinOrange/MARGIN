@@ -50,7 +50,7 @@ def compute_margin(
     theta_vmf = math.sqrt(q / kappa_i_eff)
 
     # ---- frequency-induced lower bound（采样分辨率极限）----
-    #theta_freq = 0.5 * sigmoid(-count_i / math.sqrt(max_class_counts))
+    # theta_freq = 0.5 * sigmoid(-count_i / math.sqrt(max_class_counts))
 
     # ---- ETF Voronoi cone angle（类间分离）----
     theta_voronoi_cell = 0.5 * math.acos(-1 / (n - 1))
@@ -142,7 +142,7 @@ def compute_geometric_median(
         inv_dist = 1.0 / dist
         y_new = (X * inv_dist[:, None]).sum(dim=0) / inv_dist.sum()
         # ✅ 投影回单位球（关键）
-        y_new = F.normalize(y_new, dim=0) # 这里的 dim 是不是写错方向了
+        y_new = F.normalize(y_new, dim=0)  # 这里的 dim 是不是写错方向了
         # ✅ 收敛判断
         if torch.norm(y - y_new) < eps:
             break
