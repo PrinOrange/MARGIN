@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "debug"  # 可选其他 subset
+DATASET_SUBSET = "bigvul"  # 可选其他 subset
 MAX_LENGTH = 512
 
 # 模型配置
@@ -49,12 +49,12 @@ MAX_EPOCHS = 200
 EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 
 # ArcFace & 球面配置
-BASE_SCALE = 20  # s
+BASE_SCALE = 15  # s
 CONFIDENCE_ALPHA = 0.95  # α
 SEED = 42
 
 # 设备配置
-DEVICE = "cuda:2"
+DEVICE = "cuda:0"
 TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 # 输出配置
 OUTPUT_DIR = f"./output/{DATASET_SUBSET}-{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"

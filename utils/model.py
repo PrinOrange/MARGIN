@@ -110,13 +110,17 @@ class MARGINLossHead(nn.Module):
         mean_prototypes: torch.Tensor,
     ):
         device = kappas.device
-        C = self.num_classes
+
         max_class_count = class_counts.max().item()
         kappas = torch.clamp(kappas, min=1e-6)
 
-        u = torch.log(kappas)
-        r = torch.softmax(u / C, dim=0) * C  # mean = 1
-        new_scales = self.base_scale * r  # mean = s0
+        min_val = kappas.min()
+        max_val = kappas.max()
+        kappas_norm = (kappas - min_val) / (max_val - min_val + 1e-8)
+
+        C = self.num_classes
+
+        new_scales = self.base_scale * (1 - kappas_norm **2)
 
         new_margins = torch.zeros(C, device=device)
         # betas = torch.zeros(C, device=device)
