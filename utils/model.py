@@ -112,13 +112,16 @@ class MARGINLossHead(nn.Module):
         device = kappas.device
 
         max_class_count = class_counts.max().item()
-        kappas = torch.clamp(kappas, min=1e-6)
+        # min-max 归一化
+        kappa_min = kappas.min()
+        kappa_max = kappas.max()
+        kappas_norm = (kappas - kappa_min) / (kappa_max - kappa_min + 1e-8)
 
-        min_val = kappas.min()
-        max_val = kappas.max()
-        kappas_norm = (kappas - min_val) / (max_val - min_val + 1e-8)
+        # 反向 softmax（小 κ → 大权重）
+        scale_weights = torch.softmax(-kappas_norm, dim=0)
 
-        new_scales = self.base_scale * (2 - kappas_norm)
+        # 恢复 scale 量级
+        new_scales = self.base_scale * scale_weights * len(kappas)
         
         C = self.num_classes
         new_margins = torch.zeros(C, device=device)
