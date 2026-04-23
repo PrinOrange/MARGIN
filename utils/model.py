@@ -110,20 +110,12 @@ class MARGINLossHead(nn.Module):
         mean_prototypes: torch.Tensor,
     ):
         device = kappas.device
-
+        C = self.num_classesfix:scales
         max_class_count = class_counts.max().item()
-        # min-max 归一化
-        kappa_min = kappas.min()
-        kappa_max = kappas.max()
-        kappas_norm = (kappas - kappa_min) / (kappa_max - kappa_min + 1e-8)
-
-        # 反向 softmax（小 κ → 大权重）
-        scale_weights = torch.softmax(-kappas_norm, dim=0)
-
-        # 恢复 scale 量级
-        new_scales = self.base_scale * scale_weights * len(kappas)
+        u = torch.log(kappas)
+        r = torch.softmax(u / C, dim=0) * C  # mean = 1
+        new_scales = self.base_scale * r  # mean = s0这个代码，是Kappa越大，scale越大。但是我想反过来，仍然用这个方法 
         
-        C = self.num_classes
         new_margins = torch.zeros(C, device=device)
         # betas = torch.zeros(C, device=device)
 

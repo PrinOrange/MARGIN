@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore", category=UserWarning)
 # ==================== 常量配置区 ====================
 # 数据配置
 DATASET_NAME = "codemetic/MARGIN"
-DATASET_SUBSET = "megavul"  # 可选其他 subset
+DATASET_SUBSET = "bigvul"  # 可选其他 subset
 MAX_LENGTH = 512
 
 # 模型配置
