@@ -49,12 +49,12 @@ MAX_EPOCHS = 200
 EARLY_STOPPING_PATIENCE = MAX_EPOCHS
 
 # ArcFace & 球面配置
-BASE_SCALE = 20  # s
+BASE_SCALE = 30  # s
 CONFIDENCE_ALPHA = 0.95  # α
 SEED = 42
 
 # 设备配置
-DEVICE = "cuda:2"
+DEVICE = "cuda:0"
 TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
 # 输出配置
 OUTPUT_DIR = f"./output/{DATASET_SUBSET}-{MODEL_NAME.split('/')[1]}-{TIME_PREFIX}"
