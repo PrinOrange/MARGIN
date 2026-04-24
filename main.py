@@ -18,57 +18,57 @@ def parse_args():
         "--dataset_name",
         type=str,
         default="codemetic/MARGIN",
-        help="HuggingFace 数据集名称 (默认: codemetic/MARGIN)",
+        help="HuggingFace 数据集名称 (默认：codemetic/MARGIN)",
     )
     parser.add_argument(
         "--dataset_subset",
         type=str,
         default="bigvul",
-        help="数据集子集名称 (默认: bigvul)",
+        help="数据集子集名称 (默认：bigvul)",
     )
     parser.add_argument(
         "--backbone_name",
         type=str,
         default="microsoft/unixcoder-base",
-        help="预训练模型名称 (默认: microsoft/unixcoder-base)",
+        help="预训练模型名称 (默认：microsoft/unixcoder-base)",
     )
 
     # --- 超参数配置 ---
     parser.add_argument(
-        "--base_scale", type=int, default=10, help="Base scale 参数 (默认: 10)"
+        "--base_scale", type=int, default=10, help="Base scale 参数 (默认：10)"
     )
     parser.add_argument(
         "--confidence_alpha",
         type=float,
         default=0.95,
-        help="Confidence Alpha 参数 (默认: 0.95)",
+        help="Confidence Alpha 参数 (默认：0.95)",
     )
     parser.add_argument(
-        "--learning_rate", type=float, default=2e-5, help="学习率 (默认: 2e-5)"
+        "--learning_rate", type=float, default=2e-5, help="学习率 (默认：2e-5)"
     )
     parser.add_argument(
-        "--weight_decay", type=float, default=0.01, help="权重衰减 (默认: 0.01)"
+        "--weight_decay", type=float, default=0.01, help="权重衰减 (默认：0.01)"
     )
     parser.add_argument(
-        "--max_epochs", type=int, default=200, help="最大训练轮数 (默认: 200)"
+        "--max_epochs", type=int, default=200, help="最大训练轮数 (默认：200)"
     )
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
         default=200,
-        help="早停耐心值 (默认: 200)",
+        help="早停耐心值 (默认：200)",
     )
 
     # --- 运行环境配置 ---
-    parser.add_argument("--seed", type=int, default=42, help="随机种子 (默认: 42)")
+    parser.add_argument("--seed", type=int, default=42, help="随机种子 (默认：42)")
     parser.add_argument(
         "--device",
         type=str,
         default="cuda:1",
-        help="训练设备，如 cuda:0, cpu (默认: cuda:1)",
+        help="训练设备，如 cuda:0, cpu (默认：cuda:1)",
     )
     parser.add_argument(
-        "--batch_size", type=int, default=16, help="批次大小 (默认: 16)"
+        "--batch_size", type=int, default=16, help="批次大小 (默认：16)"
     )
 
     # UMAP 相关参数
@@ -86,7 +86,7 @@ def main():
 
     # 生成时间戳前缀，用于区分不同次运行的输出文件夹
     TIME_PREFIX = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
-    OUTPUT_DIR = f"./output/{args.dataset_subset}-{args.backbone_name.split('/')[0]}-{TIME_PREFIX}"
+    OUTPUT_DIR = f"./output/{args.dataset_subset}-{args.backbone_name.split('/')[1]}-{TIME_PREFIX}"
     log.set_log_file(os.path.join(OUTPUT_DIR, "train.log"))
 
     # 3. 使用 args 中的值构建配置

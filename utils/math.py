@@ -28,17 +28,9 @@ def compute_vmf_kappa(features, prototype):
     kappa = r * (d - r * r) / (1 - r * r)
     return max(kappa, 1e-6)
 
-
-import torch
-import math
-
-import torch
-import math
-from scipy.stats import chi2
-
 def compute_margin(
     kappas: torch.Tensor,  # [C]
-    mean_prototypes: torch.Tensor,  # [C, d] (assumed normalized)
+    mean_prototypes: torch.Tensor,  # unused
     dim: int,
     alpha: float = 0.95,
 ):
@@ -58,41 +50,28 @@ def compute_margin(
     theta_voronoi = 0.5 * math.acos(-1 / (C - 1))
 
     # =========================
-    # 3. prototype pairwise angle
+    # 3. global minimum cone
     # =========================
-    # cosine similarity
-    cos_sim = torch.matmul(mean_prototypes, mean_prototypes.T)  # [C, C]
-    cos_sim = torch.clamp(cos_sim, -1 + 1e-6, 1 - 1e-6)
-
-    angles = torch.acos(cos_sim)  # [C, C]
-
-    # mask self
-    mask = torch.eye(C, dtype=torch.bool, device=device)
-    angles = angles.masked_fill(mask, float('inf'))
+    theta_minimum_angle = torch.min(theta_vmf)
 
     # =========================
-    # 4. compute overlap
+    # 4. exceed
     # =========================
-    theta_i = theta_vmf.unsqueeze(1)  # [C,1]
-    theta_j = theta_vmf.unsqueeze(0)  # [1,C]
-
-    overlap = theta_i + theta_j - angles  # [C,C]
-
-    # only keep positive overlap
-    overlap = torch.clamp(overlap, min=0.0)
-
-    # take worst overlap per class
-    theta_overlap = overlap.max(dim=1).values  # [C]
+    theta_exceed = theta_vmf - theta_voronoi
 
     # =========================
-    # 5. exceed (no overlap case)
+    # 5. fallback
     # =========================
-    theta_exceed = torch.clamp(theta_vmf - theta_voronoi, min=0.0)
+    theta_fallback = theta_vmf - theta_minimum_angle
+    theta_fallback = theta_fallback.expand_as(theta_vmf)
 
     # =========================
-    # 6. final margin
+    # 6. final margin（合法写法）
     # =========================
-    margins = torch.max(theta_overlap, theta_exceed)
+    margins = torch.maximum(
+        torch.maximum(theta_exceed, theta_fallback),
+        torch.zeros_like(theta_vmf)
+    )
 
     return margins
 
