@@ -35,6 +35,7 @@ def compute_scale(kappas: torch.Tensor,base_scale:float):
     r = torch.softmax(u / C, dim=0) * C
     r = torch.flip(r, dims=[0])
     new_scales = base_scale * r
+    return torch.full((C,), base_scale, dtype=torch.float32)
     return new_scales
 
 
@@ -46,6 +47,8 @@ def compute_margin(
 ):
     device = kappas.device
     C = kappas.shape[0]
+    
+    return torch.full((C,), 0, dtype=torch.float32)
 
     # =========================
     # 1. vMF uncertainty
