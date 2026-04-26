@@ -240,7 +240,9 @@ class Trainer:
         )
         log.print(
             f"🐒 Positive-Macro - MCC: {classification_metrics['positive_macro']['mcc']:.4f}, "
-            f"F1: {classification_metrics['positive_macro']['f1']:.4f}"
+            f"F1: {classification_metrics['positive_macro']['f1']:.4f}, "
+            f"Prec: {classification_metrics['positive_macro']['precision']:.4f}, "
+            f"Rec: {classification_metrics['positive_macro']['recall']:.4f}, "
         )
         log.print(
             f"🌏 Global-Macro - MCC: {classification_metrics['global_macro']['mcc']:.4f}, "

@@ -40,7 +40,6 @@ class MARGINModel(nn.Module):
         self.layer_weights = nn.Parameter(torch.ones(1))
         nn.init.xavier_uniform_(self.weights)
 
-        self.class_counts = torch.zeros(self.num_classes)
         self.current_kappas = torch.zeros(self.num_classes)
         self.current_mean_prototypes = torch.zeros(self.num_classes, self.embedding_dim)
         self.current_geometric_median_prototypes = torch.zeros(
